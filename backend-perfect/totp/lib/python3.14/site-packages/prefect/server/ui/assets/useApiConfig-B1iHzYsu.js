@@ -1,1 +1,0 @@
-import{i as e}from"./index-DpFlA-Lk.js";import{i as t}from"./usePrefectApi-D-PRLtA0.js";async function n(n){let r=await t.get(`apiUrl`,void 0,n),i={baseUrl:r};return r.startsWith(`/`)&&e()===`development`&&(i.baseUrl=`http://127.0.0.1:4200${r}`),{config:i}}export{n as t};

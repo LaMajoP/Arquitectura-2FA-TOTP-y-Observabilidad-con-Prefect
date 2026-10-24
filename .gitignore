@@ -1,18 +1,26 @@
-# Secrets and local environment overrides
+# Secrets and environment variables
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
-# Python environments, caches, and test output
+# Python virtual environments
 .venv/
 venv/
 env/
+
+# Python caches and testing
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
 coverage/
+htmlcov/
 
-# JavaScript dependencies, tooling caches, and generated output
+# JavaScript / Expo
 node_modules/
 .expo/
 .metro-health-check*
@@ -20,7 +28,8 @@ dist/
 web-build/
 *.tsbuildinfo
 
-# OS and editor files
+# Local IDE and OS files
 .DS_Store
 *.swp
 *.swo
+.idea/

@@ -1,4 +1,8 @@
-"""Independent RFC 6238 TOTP implementation using only Python's standard library."""
+"""Independent RFC 6238 TOTP implementation using only Python's standard library.
+
+``generate_totp`` receives an already calculated time counter, while
+``verify_totp`` receives a Unix timestamp in seconds.
+"""
 
 from __future__ import annotations
 
@@ -62,8 +66,29 @@ def _decode_base32(secret: str) -> bytes:
     return base64.b32decode(encoded + "=" * expected_padding, casefold=False)
 
 
+def _timestamp_to_counter(timestamp: float | int | None) -> int:
+    """Convert a Unix timestamp in seconds into an unsigned 64-bit TOTP counter."""
+    if timestamp is None:
+        timestamp = time.time()
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        raise TypeError("Timestamp must be a Unix timestamp in seconds.")
+    if isinstance(timestamp, float) and not math.isfinite(timestamp):
+        raise ValueError("Timestamp must be a finite, non-negative Unix timestamp in seconds.")
+    if timestamp < 0:
+        raise ValueError("Timestamp must be a finite, non-negative Unix timestamp in seconds.")
+
+    counter = int(timestamp // TIME_STEP_SECONDS)
+    if counter > _UINT64_MAX:
+        raise ValueError("Timestamp produces a TOTP counter outside the unsigned 64-bit range.")
+    return counter
+
+
 def generate_totp(secret: str, counter: int) -> str:
-    """Generate one six-digit HMAC-SHA1 code for an unsigned 64-bit counter."""
+    """Generate one six-digit HMAC-SHA1 code for an unsigned 64-bit counter.
+
+    ``counter`` is the direct value ``floor(unix_time_seconds / 30)``. Unlike
+    the TypeScript API, this function never accepts Unix milliseconds.
+    """
     if isinstance(counter, bool) or not isinstance(counter, int):
         raise TypeError("TOTP counter must be an integer.")
     if not 0 <= counter <= _UINT64_MAX:
@@ -81,18 +106,16 @@ def generate_totp(secret: str, counter: int) -> str:
 def verify_totp(
     secret: str, code: str, timestamp: float | None = None
 ) -> TOTPVerificationResult:
-    """Verify a code in the previous, current, or next 30-second time window."""
-    if timestamp is None:
-        timestamp = time.time()
-    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
-        raise TypeError("Timestamp must be a Unix timestamp in seconds.")
-    if not math.isfinite(timestamp) or timestamp < 0:
-        raise ValueError("Timestamp must be a finite, non-negative Unix timestamp in seconds.")
+    """Verify a code in the previous, current, or next 30-second time window.
+
+    ``timestamp`` is Unix time in seconds, unlike the millisecond timestamp
+    accepted by the mobile ``generateTOTP`` function.
+    """
+    current_counter = _timestamp_to_counter(timestamp)
 
     if not isinstance(code, str) or len(code) != OTP_DIGITS or not code.isascii() or not code.isdigit():
         return TOTPVerificationResult(valid=False, counter=None, window=None)
 
-    current_counter = math.floor(timestamp / TIME_STEP_SECONDS)
     for window in (-1, 0, 1):
         counter = current_counter + window
         if counter < 0:

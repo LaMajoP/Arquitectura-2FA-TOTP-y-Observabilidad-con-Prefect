@@ -1,1 +1,0 @@
-import{Hi as e,_a as t,ca as n}from"./index-BD_kIOMy-DN2IPMog.js";function r(...r){let i=[...r,`Prefect Server`],a=e(()=>i.map(e=>t(e)).filter(e=>e!==null).join(` • `));n(()=>document.title=a.value)}export{r as t};
