@@ -118,7 +118,7 @@ def verify_totp(
 
     for window in (-1, 0, 1):
         counter = current_counter + window
-        if counter < 0:
+        if counter < 0 or counter > _UINT64_MAX:
             continue
         expected_code = generate_totp(secret, counter)
         if hmac.compare_digest(expected_code, code):
