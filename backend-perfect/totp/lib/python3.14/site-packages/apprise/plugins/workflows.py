@@ -1,0 +1,851 @@
+# BSD 2-Clause License
+#
+# Apprise - Push Notification Library.
+# Copyright (c) 2026, Chris Caron <lead2gold@gmail.com>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# To use this plugin, you need to create a MS Teams Azure Webhook Workflow:
+#  https://support.microsoft.com/en-us/office/browse-and-add-workflows-\
+#       in-microsoft-teams-4998095c-8b72-4b0e-984c-f2ad39e6ba9a
+
+# Your webhook will look somthing like this (legacy):
+# https://prod-161.westeurope.logic.azure.com:443/\
+#       workflows/643e69f83c8944438d68119179a10a64/triggers/manual/\
+#       paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&\
+#       sv=1.0&sig=KODuebWbDGYFr0z0eu-6Rj8aUKz7108W3wrNJZxFE5A
+#
+# Or it may now look something like this:
+# https://prod-161.westeurope.logic.azure.com:443/\
+#       powerautomate/automations/direct/\
+#       workflows/643e69f83c8944438d68119179a10a64/triggers/manual/\
+#       paths/invoke?api-version=2022-03-01-preview&sp=%2Ftriggers%2Fmanual%2F\
+#       run&sv=1.0&sig=KODuebWbDGYFr0z0eu-6Rj8aUKz7108W3wrNJZxFE5A
+#
+# Yes... The URL is that big... But it looks like this (greatly simplified):
+# https://HOST:PORT/workflows/ABCD/triggers/manual/path/...sig=DEFG
+#          ^    ^                ^                              ^
+#          |    |                |                              |
+#  These are important <---------^------------------------------^
+#
+#
+# Apprise can support this webhook as is (directly passed into it)
+# Alternatively it can be shortend to:
+
+# These 3 tokens need to be placed in the URL after the Team
+#   workflows://HOST:PORT/ABCD/DEFG/
+#
+
+import json
+from json.decoder import JSONDecodeError
+import re
+
+import requests
+
+from ..apprise_attachment import AppriseAttachment
+from ..common import NotifyFormat, NotifyImageSize, NotifyType
+from ..locale import gettext_lazy as _
+from ..utils.parse import parse_bool, validate_regex
+from ..utils.templates import TemplateType, apply_template
+from .base import NotifyBase
+
+
+class APIVersion:
+    """
+    Define API Versions
+    """
+
+    WORKFLOW = "2016-06-01"
+    POWER_AUTOMATE = "2022-03-01-preview"
+
+
+# Match Teams ``<at>...</at>`` mentions in the message body.
+# Adaptive Cards require a matching entity for each resolved mention.
+#
+# ``[^<]+`` keeps matching linear and stops before a nested opening tag.
+# This allows a valid inner mention to survive a malformed outer wrapper,
+# such as ``<at><at>user</at>`` or ``<at>text<at>user</at>``.
+#
+# Detection runs only for generated Teams Adaptive Cards. Template-based
+# Power Automate flows bypass this payload path.
+WORKFLOWS_MENTION_RE = re.compile(r"<at>([^<]+)</at>", re.I)
+
+
+class NotifyWorkflows(NotifyBase):
+    """A wrapper for Microsoft Workflows (MS Teams) Notifications."""
+
+    # The default descriptive name associated with the Notification
+    service_name = "Power Automate / Workflows (for MSTeams)"
+
+    # The services URL
+    service_url = (
+        "https://www.microsoft.com/power-platform/products/power-automate"
+    )
+
+    # The default secure protocol
+    secure_protocol = ("workflow", "workflows")
+
+    # A URL that takes you to the setup/help of the specific protocol
+    setup_url = "https://appriseit.com/services/workflows/"
+
+    # Allows the user to specify the NotifyImageSize object
+    image_size = NotifyImageSize.XY_32
+
+    # The maximum allowable characters allowed in the body per message
+    body_maxlen = 1000
+
+    # Default Notification Format
+    notify_format = NotifyFormat.MARKDOWN
+
+    # There is no reason we should exceed 35KB when reading in a JSON file.
+    # If it is more than this, then it is not accepted
+    max_workflows_template_size = 35000
+
+    # Adaptive Card Version
+    adaptive_card_version = "1.4"
+
+    # Define object templates
+    templates = (
+        "{schema}://{host}/{workflow}/{signature}",
+        "{schema}://{host}:{port}/{workflow}/{signature}",
+    )
+
+    # Define our template tokens
+    template_tokens = dict(
+        NotifyBase.template_tokens,
+        **{
+            "host": {
+                "name": _("Hostname"),
+                "type": "string",
+                "required": True,
+            },
+            "port": {
+                "name": _("Port"),
+                "type": "int",
+                "min": 1,
+                "max": 65535,
+            },
+            # workflow identifier
+            "workflow": {
+                "name": _("Workflow ID"),
+                "type": "string",
+                "private": True,
+                "required": True,
+                "regex": (r"^[A-Z0-9_-]+$", "i"),
+            },
+            # Signature
+            "signature": {
+                "name": _("Signature"),
+                "type": "string",
+                "private": True,
+                "required": True,
+                "regex": (r"^[a-z0-9_-]+$", "i"),
+            },
+        },
+    )
+
+    # Define our template arguments
+    template_args = dict(
+        NotifyBase.template_args,
+        **{
+            "id": {
+                "alias_of": "workflow",
+            },
+            "image": {
+                "name": _("Include Image"),
+                "type": "bool",
+                "default": True,
+                "map_to": "include_image",
+            },
+            "pa": {
+                "name": _("Use Power Automate URL"),
+                "type": "bool",
+                "default": False,
+                "map_to": "power_automate",
+            },
+            "powerautomate": {"alias_of": "pa"},
+            "route": {
+                "name": _("Power Automate Routing ID"),
+                "type": "string",
+                "regex": (r"^[0-9]+$", ""),
+                "map_to": "routing_id",
+            },
+            "routeid": {"alias_of": "route"},
+            "wrap": {
+                "name": _("Wrap Text"),
+                "type": "bool",
+                "default": True,
+            },
+            "template": {
+                "name": _("Template Path"),
+                "type": "string",
+                "private": True,
+            },
+            # Below variable shortforms are taken from the Workflows webhook
+            # for consistency
+            "sig": {
+                "alias_of": "signature",
+            },
+            "ver": {
+                "name": _("API Version"),
+                "type": "string",
+                "map_to": "version",
+            },
+            "api-version": {"alias_of": "ver"},
+        },
+    )
+
+    # Define our token control
+    template_kwargs = {
+        "tokens": {
+            "name": _("Template Tokens"),
+            "prefix": ":",
+        },
+    }
+
+    def __init__(
+        self,
+        workflow,
+        signature,
+        include_image=None,
+        power_automate=None,
+        routing_id=None,
+        version=None,
+        template=None,
+        tokens=None,
+        wrap=None,
+        **kwargs,
+    ):
+        """Initialize Microsoft Workflows Object."""
+        super().__init__(**kwargs)
+
+        self.workflow = validate_regex(
+            workflow, *self.template_tokens["workflow"]["regex"]
+        )
+        if not self.workflow:
+            msg = f"An invalid Workflows ID ({workflow}) was specified."
+            self.logger.warning(msg)
+            raise TypeError(msg)
+
+        self.signature = validate_regex(
+            signature, *self.template_tokens["signature"]["regex"]
+        )
+        if not self.signature:
+            msg = f"An invalid Signature ({signature}) was specified."
+            self.logger.warning(msg)
+            raise TypeError(msg)
+
+        # Place a thumbnail image inline with the message body
+        self.include_image = bool(
+            include_image
+            if include_image is not None
+            else self.template_args["image"]["default"]
+        )
+
+        # Power Automate status
+        self.power_automate = bool(
+            power_automate
+            if power_automate is not None
+            else self.template_args["pa"]["default"]
+        )
+
+        # Microsoft may provide a routing ID in native Power Automate URLs
+        self.routing_id = None
+        if routing_id is not None:
+            self.routing_id = validate_regex(
+                routing_id, *self.template_args["route"]["regex"]
+            )
+            if not self.routing_id:
+                msg = (
+                    "An invalid Workflows Routing ID"
+                    f" ({routing_id}) was specified."
+                )
+                self.logger.warning(msg)
+                raise TypeError(msg)
+
+        # Wrap Text
+        self.wrap = bool(
+            wrap if wrap is not None else self.template_args["wrap"]["default"]
+        )
+
+        # Our template object is just an AppriseAttachment object
+        self.template = AppriseAttachment(asset=self.asset)
+        if template:
+            # Add our definition to our template
+            self.template.add(template)
+            if not len(self.template):
+                # add() failed (unsupported schema, unparseable URL, etc.)
+                msg = "The Workflows template specified could not be loaded."
+                self.logger.warning(msg)
+                raise TypeError(msg)
+            # Enforce maximum file size
+            self.template[0].max_file_size = self.max_workflows_template_size
+
+        # Prepare Version
+        # The default is taken from the template_args
+        # - If using power_automate, the API version required is different.
+        default_api_version = (
+            APIVersion.POWER_AUTOMATE
+            if self.power_automate
+            else APIVersion.WORKFLOW
+        )
+
+        self.api_version = (
+            version if version is not None else default_api_version
+        )
+
+        # Template functionality
+        self.tokens = {}
+        if isinstance(tokens, dict):
+            self.tokens.update(tokens)
+
+        elif tokens:
+            msg = (
+                "The specified Workflows Template Tokens "
+                f"({tokens}) are not identified as a dictionary."
+            )
+            self.logger.warning(msg)
+            raise TypeError(msg)
+
+        # else:  NoneType - this is okay
+        return
+
+    def gen_payload(
+        self, body, title="", notify_type=NotifyType.INFO, **kwargs
+    ):
+        """This function generates our payload whether it be the generic one
+        Apprise generates by default, or one provided by a specified external
+        template."""
+
+        # Acquire our to-be footer icon if configured to do so
+        image_url = (
+            None if not self.include_image else self.image_url(notify_type)
+        )
+
+        body_content = []
+        if image_url:
+            body_content.append(
+                {
+                    "type": "Image",
+                    "url": image_url,
+                    "height": "32px",
+                    "altText": notify_type.value,
+                }
+            )
+
+        if title:
+            body_content.append(
+                {
+                    "type": "TextBlock",
+                    "text": f"{title}",
+                    "style": "heading",
+                    "weight": "Bolder",
+                    "size": "Large",
+                    "id": "title",
+                }
+            )
+
+        body_content.append(
+            {
+                "type": "TextBlock",
+                "text": body,
+                "style": "default",
+                "wrap": self.wrap,
+                "id": "body",
+            }
+        )
+
+        if not self.template:
+            # By default we use a generic working payload if there was
+            # no template specified
+            schema = "http://adaptivecards.io/schemas/adaptive-card.json"
+
+            # Collect the explicit entities required to resolve Teams mentions.
+            # Dict insertion order preserves the first occurrence of each ID.
+            seen = {}
+            for m in WORKFLOWS_MENTION_RE.finditer(body):
+                # Normalize the ID and skip empty or duplicate mentions.
+                key = m.group(1).strip()
+                if not key or key in seen:
+                    continue
+
+                seen[key] = {
+                    "type": "mention",
+                    # Preserve the original tag because Teams matches mention
+                    # text verbatim, including its casing and whitespace.
+                    "text": m.group(0),
+                    "mentioned": {
+                        "id": key,
+                        "name": key,
+                    },
+                }
+
+            # Build the Teams metadata and include entities only when present.
+            msteams = (
+                {
+                    "width": "full",
+                    "entities": list(seen.values()),
+                }
+                if seen
+                else {"width": "full"}
+            )
+
+            payload = {
+                "type": "message",
+                "attachments": [
+                    {
+                        "contentType": (
+                            "application/vnd.microsoft.card.adaptive"
+                        ),
+                        "contentUrl": None,
+                        "content": {
+                            "$schema": schema,
+                            "type": "AdaptiveCard",
+                            "version": self.adaptive_card_version,
+                            "body": body_content,
+                            # Additionally
+                            "msteams": msteams,
+                        },
+                    }
+                ],
+            }
+
+            return payload
+
+        # If our code reaches here, then we generate ourselves the payload
+        template = self.template[0]
+        if not template:
+            # We could not access the attachment
+            self.logger.error(
+                "Could not access Workflow template"
+                f" {template.url(privacy=True)}."
+            )
+            return False
+
+        # Take a copy of our token dictionary
+        tokens = self.tokens.copy()
+
+        # Apply some defaults template values
+        tokens["app_body"] = body
+        tokens["app_title"] = title
+        tokens["app_type"] = notify_type.value
+        tokens["app_id"] = self.app_id
+        tokens["app_desc"] = self.app_desc
+        tokens["app_color"] = self.color(notify_type)
+        # app_color_hex is an explicit alias for app_color so templates
+        # can reference the hex variant by a self-documenting name
+        tokens["app_color_hex"] = self.color(notify_type)
+        tokens["app_image_url"] = image_url
+        tokens["app_url"] = self.app_url
+
+        # Enforce Application mode
+        tokens["app_mode"] = TemplateType.JSON
+
+        # JSON escaping expects string substitutions; map None to empty text.
+        # Preserve app_mode because it controls the template escaping mode.
+        safe_tokens = {
+            k: (
+                v
+                if k == "app_mode" or isinstance(v, str)
+                else ("" if v is None else str(v))
+            )
+            for k, v in tokens.items()
+        }
+
+        try:
+            with open(template.path) as fp:
+                content = json.loads(apply_template(fp.read(), **safe_tokens))
+
+        except OSError:
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} could not be read."
+            )
+            return False
+
+        except JSONDecodeError as e:
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} contains invalid JSON."
+            )
+            self.logger.debug(f"JSONDecodeError: {e}")
+            return False
+
+        # Validate the required payload structure for Workflows/Power Automate
+
+        # Template must parse to a JSON object, not an array or scalar
+        if not isinstance(content, dict):
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} must be a JSON object"
+                " (got {}).".format(type(content).__name__)
+            )
+            return False
+
+        # Root payload must be a Workflows/Power Automate 'message' type
+        if content.get("type") != "message":
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} must have"
+                " 'type': 'message'"
+                " (got {!r}).".format(content.get("type"))
+            )
+            return False
+
+        # Payload must carry a non-empty attachments list
+        if (
+            not isinstance(content.get("attachments"), list)
+            or not content["attachments"]
+        ):
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} must contain"
+                " a non-empty 'attachments' list."
+            )
+            return False
+
+        # Each attachment must be a dict with a contentType string
+        if not all(
+            isinstance(a, dict) and isinstance(a.get("contentType"), str)
+            for a in content["attachments"]
+        ):
+            self.logger.error(
+                "Workflow template"
+                f" {template.url(privacy=True)} contains an"
+                " attachment missing a 'contentType' string."
+            )
+            return False
+
+        return content
+
+    def send(self, body, title="", notify_type=NotifyType.INFO, **kwargs):
+        """Perform Microsoft Teams Notification."""
+
+        headers = {
+            "User-Agent": self.app_id,
+            "Content-Type": "application/json",
+        }
+
+        params = {
+            "api-version": self.api_version,
+            "sp": "/triggers/manual/run",
+            "sv": "1.0",
+            "sig": self.signature,
+        }
+
+        # The URL changes depending on whether we're using power automate or
+        # not
+        path = (
+            "/powerautomate/automations/direct" if self.power_automate else ""
+        )
+        if path and self.routing_id:
+            path += f"/cu/{self.routing_id}"
+
+        notify_url = (
+            "https://{host}{port}{path}/workflows/{workflow}/"
+            "triggers/manual/paths/invoke".format(
+                host=self.host,
+                port="" if not self.port else f":{self.port}",
+                path=path,
+                workflow=self.workflow,
+            )
+        )
+
+        # Generate our payload if it's possible
+        payload = self.gen_payload(
+            body=body, title=title, notify_type=notify_type, **kwargs
+        )
+        if not payload:
+            # No need to present a reason; that will come from the
+            # gen_payload() function itself
+            return False
+
+        self.logger.debug(
+            "Workflows POST URL:"
+            f" {notify_url} (cert_verify={self.verify_certificate!r})"
+        )
+        self.logger.debug(f"Workflows Payload: {payload!s}")
+
+        # Always call throttle before any remote server i/o is made
+        self.throttle()
+        try:
+            r = requests.post(
+                notify_url,
+                params=params,
+                data=json.dumps(payload),
+                headers=headers,
+                verify=self.verify_certificate,
+                timeout=self.request_timeout,
+                allow_redirects=self.redirects,
+            )
+            if r.status_code not in (
+                requests.codes.ok,
+                requests.codes.accepted,
+            ):
+                # We had a problem
+                status_str = NotifyWorkflows.http_response_code_lookup(
+                    r.status_code
+                )
+
+                self.logger.warning(
+                    "Failed to send Workflows notification: "
+                    "{}{}error={}.".format(
+                        status_str, ", " if status_str else "", r.status_code
+                    )
+                )
+
+                self.logger.debug(
+                    "Response Details:\r\n%r", (r.content or b"")[:2000]
+                )
+
+                # We failed
+                return False
+
+            else:
+                self.logger.info("Sent Workflows notification.")
+
+        except requests.RequestException as e:
+            self.logger.warning(
+                "A Connection error occurred sending Workflows notification."
+            )
+            self.logger.debug(f"Socket Exception: {e!s}")
+
+            # We failed
+            return False
+
+        return True
+
+    @property
+    def url_identifier(self):
+        """Returns all of the identifiers that make this URL unique from
+        another simliar one.
+
+        Targets or end points should never be identified here.
+        """
+        return (
+            self.secure_protocol[0],
+            self.host,
+            self.port,
+            self.workflow,
+            self.signature,
+            self.routing_id,
+        )
+
+    def url(self, privacy=False, *args, **kwargs):
+        """Returns the URL built dynamically based on specified arguments."""
+
+        # Define any URL parameters
+        params = {
+            "image": "yes" if self.include_image else "no",
+            "wrap": "yes" if self.wrap else "no",
+            "pa": "yes" if self.power_automate else "no",
+        }
+
+        if self.routing_id:
+            params["route"] = self.routing_id
+
+        if self.template:
+            params["template"] = NotifyWorkflows.quote(
+                self.template[0].url(), safe=""
+            )
+
+        # Store our version if it differs from default
+        if (
+            self.api_version != APIVersion.WORKFLOW and not self.power_automate
+        ) or (
+            self.api_version != APIVersion.POWER_AUTOMATE
+            and self.power_automate
+        ):
+            # But only do so if we're not using power automate with the
+            # default version for that.
+            params["ver"] = self.api_version
+
+        # Extend our parameters
+        params.update(self.url_parameters(privacy=privacy, *args, **kwargs))
+        # Store any template entries if specified
+        params.update({f":{k}": v for k, v in self.tokens.items()})
+
+        return (
+            "{schema}://{host}{port}/{workflow}/{signature}/?{params}".format(
+                schema=self.secure_protocol[0],
+                host=self.host,
+                port="" if not self.port else f":{self.port}",
+                workflow=self.pprint(self.workflow, privacy, safe=""),
+                signature=self.pprint(self.signature, privacy, safe=""),
+                params=NotifyWorkflows.urlencode(params),
+            )
+        )
+
+    @staticmethod
+    def parse_url(url):
+        """Parses the URL and returns enough arguments that can allow us to re-
+        instantiate this object."""
+
+        results = NotifyBase.parse_url(url)
+        if not results:
+            # We're done early as we couldn't load the results
+            return results
+
+        # store values if provided
+        entries = NotifyWorkflows.split_path(results["fullpath"])
+
+        # Display image?
+        results["include_image"] = parse_bool(
+            results["qsd"].get(
+                "image", NotifyWorkflows.template_args["image"]["default"]
+            )
+        )
+
+        # Support Power Automate URL
+        results["power_automate"] = parse_bool(
+            results["qsd"].get(
+                "powerautomate",
+                results["qsd"].get(
+                    "pa", NotifyWorkflows.template_args["pa"]["default"]
+                ),
+            )
+        )
+
+        # Power Automate CU routing ID
+        if "route" in results["qsd"] and results["qsd"]["route"]:
+            results["routing_id"] = NotifyWorkflows.unquote(
+                results["qsd"]["route"]
+            )
+
+        elif "routeid" in results["qsd"] and results["qsd"]["routeid"]:
+            results["routing_id"] = NotifyWorkflows.unquote(
+                results["qsd"]["routeid"]
+            )
+
+        # Wrap Text?
+        results["wrap"] = parse_bool(
+            results["qsd"].get(
+                "wrap", NotifyWorkflows.template_args["wrap"]["default"]
+            )
+        )
+
+        # Template Handling
+        if "template" in results["qsd"] and results["qsd"]["template"]:
+            results["template"] = NotifyWorkflows.unquote(
+                results["qsd"]["template"]
+            )
+
+        if "workflow" in results["qsd"] and results["qsd"]["workflow"]:
+            results["workflow"] = NotifyWorkflows.unquote(
+                results["qsd"]["workflow"]
+            )
+
+        elif "id" in results["qsd"] and results["qsd"]["id"]:
+            results["workflow"] = NotifyWorkflows.unquote(results["qsd"]["id"])
+
+        else:
+            results["workflow"] = (
+                None
+                if not entries
+                else NotifyWorkflows.unquote(entries.pop(0))
+            )
+
+        # Signature
+        if "signature" in results["qsd"] and results["qsd"]["signature"]:
+            results["signature"] = NotifyWorkflows.unquote(
+                results["qsd"]["signature"]
+            )
+
+        elif "sig" in results["qsd"] and results["qsd"]["sig"]:
+            results["signature"] = NotifyWorkflows.unquote(
+                results["qsd"]["sig"]
+            )
+
+        else:
+            # Read information from path
+            results["signature"] = (
+                None
+                if not entries
+                else NotifyWorkflows.unquote(entries.pop(0))
+            )
+
+        # Version
+        if "api-version" in results["qsd"] and results["qsd"]["api-version"]:
+            results["version"] = NotifyWorkflows.unquote(
+                results["qsd"]["api-version"]
+            )
+
+        elif "ver" in results["qsd"] and results["qsd"]["ver"]:
+            results["version"] = NotifyWorkflows.unquote(results["qsd"]["ver"])
+
+        # Store our tokens
+        results["tokens"] = results["qsd:"]
+
+        return results
+
+    @staticmethod
+    def parse_native_url(url):
+        """
+        Support parsing the webhook straight out of workflows
+            https://HOST:443/workflows/WORKFLOWID/triggers/manual/paths/invoke
+            or
+            https://HOST:443/powerautomate/automations/direct/workflows
+            /WORKFLOWID/triggers/manual/paths/invoke
+        """
+
+        # Match our workflows webhook URL and re-assemble
+        result = re.match(
+            r"^https?://(?P<host>[A-Z0-9_.-]+)"
+            r"(?P<port>:[1-9][0-9]{0,5})?"
+            # The new URL structure includes /powerautomate/automations/direct
+            # and may include a CU routing ID before /workflows
+            r"(?P<power_automate>/powerautomate/automations/direct"
+            r"(?:/cu/(?P<routing_id>[0-9]+))?)?"
+            r"/workflows/"
+            r"(?P<workflow>[A-Z0-9_-]+)"
+            r"/triggers/manual/paths/invoke/?"
+            r"(?P<params>\?.+)$",
+            url,
+            re.I,
+        )
+
+        if result:
+            # Determine if we're using power automate or not
+            power_automate = (
+                "&pa=yes" if result.group("power_automate") else ""
+            )
+
+            # Construct our URL
+            results = NotifyWorkflows.parse_url(
+                "{schema}://{host}{port}/{workflow}/{params}{pa}".format(
+                    schema=NotifyWorkflows.secure_protocol[0],
+                    host=result.group("host"),
+                    port=(
+                        ""
+                        if not result.group("port")
+                        else result.group("port")
+                    ),
+                    workflow=result.group("workflow"),
+                    params=result.group("params"),
+                    pa=power_automate,
+                )
+            )
+            if result.group("routing_id"):
+                results["routing_id"] = result.group("routing_id")
+            return results
+        return None

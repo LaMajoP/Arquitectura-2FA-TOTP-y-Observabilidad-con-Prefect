@@ -1,0 +1,26 @@
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+
+# Python environments, caches, and test output
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+coverage/
+
+# JavaScript dependencies, tooling caches, and generated output
+node_modules/
+.expo/
+.metro-health-check*
+dist/
+web-build/
+*.tsbuildinfo
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
