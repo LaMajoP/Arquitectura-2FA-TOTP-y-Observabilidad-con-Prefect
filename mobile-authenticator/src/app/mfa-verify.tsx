@@ -15,18 +15,20 @@ export default function MfaVerifyScreen() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!session.preAuthToken) router.replace("/login");
-  }, [session.preAuthToken]);
-
-  useEffect(() => {
-  if (session.accessToken) {
-    router.replace("/session");
-  }
-  }, [session.accessToken]);
+    // An access token always wins over a transitional pre-auth token. This
+    // avoids routing to login while React commits setAccessSession().
+    if (session.accessToken) {
+      router.replace("/session");
+      return;
+    }
+    if (!session.preAuthToken) {
+      router.replace("/login");
+    }
+  }, [session.accessToken, session.preAuthToken]);
 
   async function submit(): Promise<void> {
     if (!session.preAuthToken) {
-      router.replace("/login");
+      setError("La sesión temporal no está disponible. Inicia sesión de nuevo.");
       return;
     }
     const normalized = method === "totp" ? code.replace(/\s/g, "") : code.trim();
@@ -40,7 +42,8 @@ export default function MfaVerifyScreen() {
       const result = await verifyMfa(session.preAuthToken, method, normalized);
       session.setAccessSession(result.access_token);
       setCode("");
-          } catch (caught) {
+      // The effect above navigates after React commits the access token.
+    } catch (caught) {
       if (caught instanceof ApiError && caught.status === 401) {
         setError("La verificación no pudo completarse. Si el token temporal venció, inicia sesión de nuevo.");
       } else if (caught instanceof ApiError) {

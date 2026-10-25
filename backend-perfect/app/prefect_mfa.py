@@ -48,6 +48,14 @@ class MFAFlowStorageError(RuntimeError):
     """Protected MFA persistence is unavailable."""
 
 
+class ReplayAttackDetected(RuntimeError):
+    """Supabase confirmed a reused pre-auth token or TOTP time counter."""
+
+    def __init__(self, evidence: str) -> None:
+        super().__init__("MFA replay was detected.")
+        self.evidence = evidence
+
+
 @dataclass(frozen=True, slots=True)
 class SafeTaskResult:
     """A non-sensitive status that Prefect may retain transiently."""
@@ -69,6 +77,7 @@ class _MFAFlowContext:
     step_up_service: StepUpService
     authenticated_user: AuthenticatedUser | None = None
     pre_auth_seen: bool = False
+    replay_evidence: str | None = None
     issued_session: IssuedToken | None = None
     started_at: float = field(default_factory=time.perf_counter)
 
@@ -140,18 +149,38 @@ def validate_pre_auth_state(correlation_id: str) -> SafeTaskResult:
 
 @task(name="check_anti_replay_cache", retries=0, persist_result=False, log_prints=False)
 def check_anti_replay_cache(correlation_id: str) -> SafeTaskResult:
-    """Read an advisory signal; SQL confirmation remains the anti-replay authority."""
+    """Fail observability only after Supabase has supplied replay evidence."""
     context = _contexts.get(correlation_id)
     user = context.authenticated_user
     if user is None or user.token_id is None:
         return SafeTaskResult(status="authentication_failed")
+
+    # A TOTP replay is known only after strategy validation and the atomic SQL
+    # confirmation. The flow invokes this task a second time in that case so
+    # Prefect marks this dedicated anti-replay task as Failed.
+    if context.replay_evidence is not None:
+        _observe(
+            "mfa_replay_attack_detected",
+            correlation_id,
+            method=context.method,
+            evidence=context.replay_evidence,
+        )
+        raise ReplayAttackDetected(context.replay_evidence)
+
     try:
         context.pre_auth_seen = context.repository.is_pre_auth_token_consumed(user.user_id, user.token_id)
     except DatabaseError:
         _observe("mfa_supabase_error", correlation_id, method=context.method, stage="anti_replay_hint")
         return SafeTaskResult(status="storage_error")
     if context.pre_auth_seen:
-        _observe("mfa_pre_auth_reuse_hint", correlation_id, method=context.method)
+        context.replay_evidence = "pre_auth_jti"
+        _observe(
+            "mfa_pre_auth_reused",
+            correlation_id,
+            method=context.method,
+            evidence=context.replay_evidence,
+        )
+        raise ReplayAttackDetected(context.replay_evidence)
     return SafeTaskResult(status="ok")
 
 
@@ -163,7 +192,7 @@ def execute_mfa_strategy(correlation_id: str) -> SafeTaskResult:
     if user is None or user.token_id is None or user.token_expires_at is None:
         return SafeTaskResult(status="authentication_failed")
     try:
-        context.step_up_service.verify(
+        validation = context.step_up_service.verify(
             user.user_id,
             method=context.method,
             credential=context.credential,
@@ -171,11 +200,23 @@ def execute_mfa_strategy(correlation_id: str) -> SafeTaskResult:
             pre_auth_expires_at=user.token_expires_at,
         )
     except PreAuthTokenReusedError:
-        _observe("mfa_pre_auth_reused", correlation_id, method=context.method)
-        return SafeTaskResult(status="authentication_failed")
+        context.replay_evidence = "pre_auth_jti"
+        _observe(
+            "mfa_pre_auth_reused",
+            correlation_id,
+            method=context.method,
+            evidence=context.replay_evidence,
+        )
+        return SafeTaskResult(status="replay_detected")
     except MFAReplayDetectedError:
-        _observe("mfa_totp_replay_detected", correlation_id, method=context.method)
-        return SafeTaskResult(status="authentication_failed")
+        context.replay_evidence = "totp_counter"
+        _observe(
+            "mfa_totp_replay_detected",
+            correlation_id,
+            method=context.method,
+            evidence=context.replay_evidence,
+        )
+        return SafeTaskResult(status="replay_detected")
     except AuthenticationRateLimitError as exc:
         _observe("mfa_rate_limit_reached", correlation_id, method=context.method)
         return SafeTaskResult(status="rate_limited", locked_until=exc.locked_until)
@@ -186,6 +227,15 @@ def execute_mfa_strategy(correlation_id: str) -> SafeTaskResult:
         _observe("mfa_supabase_error", correlation_id, method=context.method, stage="strategy")
         return SafeTaskResult(status="storage_error")
 
+    if validation.totp_window is not None:
+        window_label = {-1: "C-1", 0: "C", 1: "C+1"}.get(validation.totp_window)
+        if window_label is not None:
+            _observe(
+                "mfa_totp_window_validated",
+                correlation_id,
+                method=context.method,
+                totp_window=window_label,
+            )
     _observe("mfa_verification_succeeded", correlation_id, method=context.method)
     return SafeTaskResult(status="ok")
 
@@ -208,18 +258,26 @@ def mfa_step_up_flow(correlation_id: str) -> SafeTaskResult:
     context = _contexts.get(correlation_id)
     final_result = SafeTaskResult(status="storage_error")
     try:
-        for stage in (
-            validate_pre_auth_state,
-            check_anti_replay_cache,
-            execute_mfa_strategy,
-            issue_elevated_session,
-        ):
+        for stage in (validate_pre_auth_state, check_anti_replay_cache, execute_mfa_strategy):
             result = stage(correlation_id)
+            if result.status == "replay_detected":
+                # Do not redo any MFA validation. This invocation only turns
+                # already-confirmed Supabase replay evidence into a Failed task
+                # run named check_anti_replay_cache.
+                final_result = SafeTaskResult(status="replay_detected")
+                return check_anti_replay_cache(correlation_id)
             if result.status != "ok":
                 final_result = result
                 return result
+        result = issue_elevated_session(correlation_id)
+        if result.status != "ok":
+            final_result = result
+            return result
         final_result = SafeTaskResult(status="ok")
         return final_result
+    except ReplayAttackDetected:
+        final_result = SafeTaskResult(status="replay_detected")
+        raise
     finally:
         duration_ms = round((time.perf_counter() - context.started_at) * 1000, 2)
         _observe(
@@ -265,6 +323,10 @@ class MFAFlowOrchestrator:
         try:
             try:
                 result = mfa_step_up_flow(correlation_id)
+            except ReplayAttackDetected as exc:
+                # The failed Prefect task is intentional and is not an
+                # orchestration outage. Preserve the generic HTTP auth result.
+                raise MFAFlowAuthenticationError("MFA authentication cannot be completed.") from exc
             except Exception as exc:
                 _observe("mfa_prefect_unavailable", correlation_id, method=method)
                 if self._settings.prefect_mfa_failure_mode == "direct_fallback":

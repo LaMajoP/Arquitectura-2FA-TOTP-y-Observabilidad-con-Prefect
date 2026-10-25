@@ -119,7 +119,13 @@ autoridad de seguridad en los servicios y funciones SQL existentes:
    propósito `pre_auth` y `mfa_verified:false`.
 2. `check_anti_replay_cache` consulta el estado persistido de consumo de `jti`
    como señal de observación. Es intencionalmente solo orientativo: la función
-   SQL de confirmación es la única autoridad para evitar carreras.
+   SQL de confirmación es la única autoridad para evitar carreras. Si esa
+   función o la confirmación atómica posterior prueba que un `jti` o contador
+   TOTP ya fue consumido, la tarea registra `ReplayAttackDetected` y queda en
+   estado **Failed**. Para el caso que solo se puede conocer tras confirmar
+   atómicamente el factor, el flow vuelve a invocar esta tarea únicamente para
+   materializar esa evidencia ya confirmada; no vuelve a validar ni consumir el
+   factor.
 3. `execute_mfa_strategy` invoca la estrategia TOTP o `backup_code` existente.
    La estrategia y `confirm_mfa_step_up` mantienen en una transacción el
    consumo de contador/código, el `jti` y la reserva de límite de intentos.
@@ -131,17 +137,22 @@ contraseña o UUID de usuario no es argumento ni resultado de Prefect: el único
 argumento es un UUID de correlación aleatorio. El contexto sensible vive solo
 en memoria durante la solicitud y se elimina al terminar. Los resultados que
 Prefect puede ver son estados seguros (`ok`, `authentication_failed`,
-`rate_limited` o `storage_error`). Esto hace que una reiniciación del backend no
-deje una sesión parcial en memoria: una petición posterior vuelve a validar el
-JWT y el estado persistido de Supabase.
+`rate_limited` o `storage_error`). Un replay confirmado es la excepción
+deliberada: deja fallidas tanto `check_anti_replay_cache` como el flow, sin
+exponer el motivo al cliente. Esto hace que una reiniciación del backend no deje
+una sesión parcial en memoria: una petición posterior vuelve a validar el JWT y
+el estado persistido de Supabase.
 
 Los eventos JSON estructurados se emiten en el logger `mfa.observability` y en
 el run de Prefect: `mfa_authentication_started`, `mfa_verification_succeeded`,
 `mfa_code_invalid`, `mfa_totp_replay_detected`, `mfa_pre_auth_reused`,
-`mfa_rate_limit_reached`, `mfa_supabase_error`, `mfa_prefect_unavailable` y
-`mfa_flow_finished` (incluye `duration_ms`). Llevan `correlation_id` y método,
-pero no correo, token, secreto o código. Los detalles de replay se usan solo
-para observabilidad; la respuesta HTTP sigue siendo genérica.
+`mfa_replay_attack_detected`, `mfa_rate_limit_reached`, `mfa_supabase_error`,
+`mfa_prefect_unavailable` y `mfa_flow_finished` (incluye `duration_ms`). Tras
+una validación TOTP correcta, `mfa_totp_window_validated` añade solamente
+`C-1`, `C` o `C+1`, calculado a partir del contador que aceptó el verificador.
+Todos llevan `correlation_id` y método, pero no correo, token, secreto o código.
+Los detalles de replay se usan solo para observabilidad; la respuesta HTTP sigue
+siendo genérica.
 
 Por defecto `PREFECT_MFA_FAILURE_MODE=fail_closed`: si la orquestación no puede
 iniciar o ejecutar el flow, `/verify-mfa` responde `503` y no habilita acceso.

@@ -18,6 +18,7 @@ from app.auth_service import (
     AuthenticationRateLimitError,
     InvalidCredentialsError,
     MFAAuthenticationError,
+    MFAReplayDetectedError,
     PasswordLoginService,
     StepUpService,
 )
@@ -29,7 +30,7 @@ from app.database import (
     StoredTOTPConfiguration,
     VerificationAttemptPermission,
 )
-from app.mfa_strategies import MFAValidationError, MFAValidationResult
+from app.mfa_strategies import BACKUP_CODE_METHOD, MFAValidationError, MFAValidationResult
 from app.passwords import PasswordService
 from app.totp_service import ACTIVE
 
@@ -85,6 +86,8 @@ class StubRepository:
         self.completion_calls: list[tuple[object, bool]] = []
         self.mfa_confirmation_calls: list[dict[str, object]] = []
         self.mfa_confirmation_result = True
+        self.pre_auth_consumed = False
+        self.totp_counter_consumed = False
 
     def reserve_auth_attempt(
         self,
@@ -120,16 +123,23 @@ class StubRepository:
         self.mfa_confirmation_calls.append(kwargs)
         return self.mfa_confirmation_result
 
+    def is_pre_auth_token_consumed(self, user_id: object, token_id: object) -> bool:
+        return self.pre_auth_consumed
+
+    def is_totp_counter_consumed(self, user_id: object, counter: int) -> bool:
+        return self.totp_counter_consumed
+
 
 class StubMFAStrategy:
-    method = "totp"
-
-    def __init__(self, *, valid: bool = True) -> None:
+    def __init__(self, *, valid: bool = True, method: str = "totp") -> None:
         self.valid = valid
+        self.method = method
 
     def validate(self, user_id: object, credential: str) -> MFAValidationResult:
         if not self.valid:
             raise MFAValidationError("MFA authentication cannot be completed.")
+        if self.method == BACKUP_CODE_METHOD:
+            return MFAValidationResult(method=self.method, backup_code_id=uuid4())
         return MFAValidationResult(method=self.method, totp_counter=1)
 
 
@@ -342,3 +352,52 @@ class StepUpServiceTests(TestCase):
                 pre_auth_expires_at=datetime.now(timezone.utc),
             )
         self.assertEqual(repository.reservation_calls[0][0], MFA_RATE_LIMIT_SCOPE)
+
+    def test_reused_totp_counter_is_rejected_after_atomic_confirmation(self) -> None:
+        user_id = uuid4()
+        repository = StubRepository(configuration=active_configuration(user_id))
+        repository.mfa_confirmation_result = False
+        repository.totp_counter_consumed = True
+        service = StepUpService(
+            repository,  # type: ignore[arg-type]
+            (StubMFAStrategy(),),  # type: ignore[arg-type]
+            rate_limit_key=b"r" * 32,
+            max_attempts=5,
+            lock_seconds=900,
+        )
+
+        with self.assertRaises(MFAReplayDetectedError):
+            service.verify(
+                user_id,
+                method="totp",
+                credential="123456",
+                pre_auth_token_id=uuid4(),
+                pre_auth_expires_at=datetime.now(timezone.utc),
+            )
+
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False])
+
+    def test_consumed_backup_code_is_rejected_without_a_session(self) -> None:
+        user_id = uuid4()
+        repository = StubRepository(configuration=active_configuration(user_id))
+        # The atomic SQL procedure reports false when the selected recovery
+        # code was consumed by a concurrent or prior request.
+        repository.mfa_confirmation_result = False
+        service = StepUpService(
+            repository,  # type: ignore[arg-type]
+            (StubMFAStrategy(method=BACKUP_CODE_METHOD),),  # type: ignore[arg-type]
+            rate_limit_key=b"r" * 32,
+            max_attempts=5,
+            lock_seconds=900,
+        )
+
+        with self.assertRaises(MFAAuthenticationError):
+            service.verify(
+                user_id,
+                method=BACKUP_CODE_METHOD,
+                credential="backup-code",
+                pre_auth_token_id=uuid4(),
+                pre_auth_expires_at=datetime.now(timezone.utc),
+            )
+
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False])

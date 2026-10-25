@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import secrets
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from uuid import UUID
 
 from totp import verify_totp
+from totp.core import TIME_STEP_SECONDS
 
 from .crypto import SecretDecryptionError, TOTPSecretCipher
 from .database import DatabaseError, SupabaseTOTPRepository
@@ -35,6 +37,10 @@ class MFAValidationResult:
 
     method: str
     totp_counter: int | None = None
+    # The accepted counter's offset from the verifier's current counter. This
+    # is observability metadata only; the SQL confirmation consumes the exact
+    # counter and remains the anti-replay authority.
+    totp_window: int | None = None
     backup_code_id: UUID | None = None
 
 
@@ -67,13 +73,23 @@ class TOTPStrategy(MFAValidationStrategy):
 
         try:
             secret_base32 = self._cipher.decrypt(configuration.encrypted_secret, user_id)
-            verification = verify_totp(secret_base32, credential)
+            verification_timestamp = time.time()
+            verification = verify_totp(
+                secret_base32,
+                credential,
+                timestamp=verification_timestamp,
+            )
         except (SecretDecryptionError, TypeError, ValueError) as exc:
             raise MFAValidationStorageError("Protected TOTP data could not be used.") from exc
 
         if not verification.valid or verification.counter is None:
             raise MFAValidationError("MFA authentication cannot be completed.")
-        return MFAValidationResult(method=self.method, totp_counter=verification.counter)
+        verifier_counter = int(verification_timestamp // TIME_STEP_SECONDS)
+        return MFAValidationResult(
+            method=self.method,
+            totp_counter=verification.counter,
+            totp_window=verification.counter - verifier_counter,
+        )
 
 
 class BackupCodeStrategy(MFAValidationStrategy):

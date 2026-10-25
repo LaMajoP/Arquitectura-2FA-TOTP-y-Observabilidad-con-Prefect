@@ -189,7 +189,7 @@ class StepUpService:
         credential: str,
         pre_auth_token_id: UUID,
         pre_auth_expires_at: datetime,
-    ) -> None:
+    ) -> MFAValidationResult:
         subject_key = derive_rate_limit_subject(
             self._rate_limit_key, MFA_RATE_LIMIT_SCOPE, str(user_id)
         )
@@ -217,6 +217,7 @@ class StepUpService:
             validation,
             reservation_id,
         )
+        return validation
 
     def _confirm_factor_and_token(
         self,
