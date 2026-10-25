@@ -39,10 +39,27 @@ class StoredPasswordUser:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredBackupCode:
+    """One server-only recovery-code hash that has not been consumed or revoked."""
+
+    code_id: UUID
+    code_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationAttemptPermission:
     """The atomic shared-state decision for one submitted verification code."""
 
     allowed: bool
+    locked_until: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class AuthAttemptReservation:
+    """A single, server-held authentication attempt reservation."""
+
+    allowed: bool
+    reservation_id: UUID | None
     locked_until: datetime | None
 
 
@@ -51,6 +68,7 @@ class SupabaseTOTPRepository:
 
     _USERS_TABLE = "app_users"
     _CREDENTIALS_TABLE = "totp_credentials"
+    _BACKUP_CODES_TABLE = "backup_codes"
 
     @staticmethod
     def _is_unique_violation(exc: Exception) -> bool:
@@ -136,6 +154,75 @@ class SupabaseTOTPRepository:
             return StoredPasswordUser(user_id=UUID(row["id"]), password_hash=password_hash)
         except (KeyError, TypeError, ValueError) as exc:
             raise DatabaseError("Stored password account is invalid.") from exc
+
+    def get_unused_backup_codes(self, user_id: UUID) -> list[StoredBackupCode]:
+        """Return only active code hashes for backend-side Argon2id verification."""
+        try:
+            response = (
+                self._client.table(self._BACKUP_CODES_TABLE)
+                .select("id,code_hash")
+                .eq("user_id", str(user_id))
+                .is_("used_at", "null")
+                .is_("revoked_at", "null")
+                .limit(10)
+                .execute()
+            )
+        except Exception as exc:
+            raise DatabaseError("Unable to read backup codes.") from exc
+
+        try:
+            records: list[StoredBackupCode] = []
+            for row in response.data or []:
+                code_hash = row["code_hash"]
+                if not isinstance(code_hash, str) or not code_hash:
+                    raise ValueError("Backup-code hash is missing.")
+                records.append(StoredBackupCode(code_id=UUID(row["id"]), code_hash=code_hash))
+            return records
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DatabaseError("Stored backup code is invalid.") from exc
+
+    def replace_backup_codes(self, user_id: UUID, code_hashes: list[str]) -> None:
+        """Atomically revoke old recovery codes and persist only Argon2id hashes."""
+        try:
+            self._client.rpc(
+                "replace_backup_codes",
+                {"p_user_id": str(user_id), "p_code_hashes": code_hashes},
+            ).execute()
+        except Exception as exc:
+            raise DatabaseError("Unable to replace backup codes.") from exc
+
+    def confirm_mfa_step_up(
+        self,
+        *,
+        user_id: UUID,
+        pre_auth_token_id: UUID,
+        pre_auth_expires_at: datetime,
+        method: str,
+        totp_counter: int | None,
+        backup_code_id: UUID | None,
+    ) -> bool:
+        """Atomically consume a valid factor and its pre-auth token JTI."""
+        try:
+            response = self._client.rpc(
+                "confirm_mfa_step_up",
+                {
+                    "p_user_id": str(user_id),
+                    "p_pre_auth_jti": str(pre_auth_token_id),
+                    "p_pre_auth_expires_at": pre_auth_expires_at.isoformat(),
+                    "p_method": method,
+                    "p_totp_counter": totp_counter,
+                    "p_backup_code_id": str(backup_code_id) if backup_code_id else None,
+                },
+            ).execute()
+            rows = response.data or []
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise ValueError("Unexpected MFA confirmation response.")
+            row = rows[0]
+            if not isinstance(row, dict) or type(row.get("confirmed")) is not bool:
+                raise ValueError("Unexpected MFA confirmation response.")
+            return row["confirmed"]
+        except Exception as exc:
+            raise DatabaseError("Unable to confirm MFA authentication.") from exc
 
     def ensure_user(self, user_id: UUID) -> None:
         try:
@@ -225,16 +312,22 @@ class SupabaseTOTPRepository:
         except Exception as exc:
             raise DatabaseError("Unable to record TOTP verification attempt.") from exc
 
-    def consume_auth_attempt(
-        self, scope: str, subject_key: str, max_attempts: int, lock_seconds: int
-    ) -> VerificationAttemptPermission:
-        """Atomically reserve a login or Step-Up check in shared Supabase state."""
+    def reserve_auth_attempt(
+        self,
+        scope: str,
+        subject_key: str,
+        reservation_id: UUID,
+        max_attempts: int,
+        lock_seconds: int,
+    ) -> AuthAttemptReservation:
+        """Atomically reserve one check and return its server-only receipt."""
         try:
             response = self._client.rpc(
-                "consume_auth_rate_limit_attempt",
+                "reserve_auth_rate_limit_attempt",
                 {
                     "p_scope": scope,
                     "p_subject_key": subject_key,
+                    "p_reservation_id": str(reservation_id),
                     "p_max_attempts": max_attempts,
                     "p_lock_seconds": lock_seconds,
                 },
@@ -252,8 +345,20 @@ class SupabaseTOTPRepository:
             if allowed:
                 if raw_locked_until is not None:
                     raise ValueError("Unexpected authentication-attempt response.")
-                return VerificationAttemptPermission(allowed=True, locked_until=None)
+                raw_reservation_id = row.get("reservation_id")
+                if not isinstance(raw_reservation_id, str):
+                    raise ValueError("Unexpected authentication-attempt response.")
+                returned_reservation_id = UUID(raw_reservation_id)
+                if returned_reservation_id != reservation_id:
+                    raise ValueError("Unexpected authentication-attempt response.")
+                return AuthAttemptReservation(
+                    allowed=True,
+                    reservation_id=returned_reservation_id,
+                    locked_until=None,
+                )
 
+            if row.get("reservation_id") is not None:
+                raise ValueError("Unexpected authentication-attempt response.")
             if isinstance(raw_locked_until, datetime):
                 locked_until = raw_locked_until
             elif isinstance(raw_locked_until, str):
@@ -262,22 +367,26 @@ class SupabaseTOTPRepository:
                 raise ValueError("Unexpected authentication-attempt response.")
             if locked_until.tzinfo is None:
                 raise ValueError("Unexpected authentication-attempt response.")
-            return VerificationAttemptPermission(
+            return AuthAttemptReservation(
                 allowed=False,
+                reservation_id=None,
                 locked_until=locked_until.astimezone(timezone.utc),
             )
         except Exception as exc:
-            raise DatabaseError("Unable to record authentication attempt.") from exc
+            raise DatabaseError("Unable to reserve authentication attempt.") from exc
 
-    def clear_auth_attempts(self, scope: str, subject_key: str) -> None:
-        """Clear reserved failures after a successful credential verification."""
+    def complete_auth_attempt(self, reservation_id: UUID, *, succeeded: bool) -> None:
+        """Finalize only the caller's reservation, never a peer's attempt."""
         try:
             self._client.rpc(
-                "clear_auth_rate_limit_attempts",
-                {"p_scope": scope, "p_subject_key": subject_key},
+                "complete_auth_rate_limit_attempt",
+                {
+                    "p_reservation_id": str(reservation_id),
+                    "p_succeeded": succeeded,
+                },
             ).execute()
         except Exception as exc:
-            raise DatabaseError("Unable to clear authentication attempts.") from exc
+            raise DatabaseError("Unable to complete authentication attempt.") from exc
 
 
 def create_repository(settings: Settings) -> SupabaseTOTPRepository:

@@ -1,4 +1,4 @@
-# Backend: registro, login y Step-Up TOTP
+# Backend: registro, login y Step-Up MFA
 
 El cálculo TOTP permanece en `totp/core.py` y no se ha reimplementado. El
 backend cifra los secretos de aprovisionamiento con AES-256-GCM, conserva las
@@ -9,11 +9,14 @@ servidor con la clave `service_role`.
 
 1. En el SQL Editor de Supabase ejecute una vez y en orden
    [`sql/001_totp_secure_storage.sql`](sql/001_totp_secure_storage.sql),
-   [`sql/002_totp_verify_rate_limit.sql`](sql/002_totp_verify_rate_limit.sql)
-   y [`sql/003_password_login_and_step_up.sql`](sql/003_password_login_and_step_up.sql).
+   [`sql/002_totp_verify_rate_limit.sql`](sql/002_totp_verify_rate_limit.sql),
+   [`sql/003_password_login_and_step_up.sql`](sql/003_password_login_and_step_up.sql)
+   y [`sql/004_mfa_strategies_and_anti_replay.sql`](sql/004_mfa_strategies_and_anti_replay.sql).
    La tercera migración es aditiva: añade las credenciales de contraseña a
    `app_users` y un límite compartido para login/Step-Up, sin alterar ni borrar
-   datos de las dos fases anteriores.
+   datos de las dos fases anteriores. La cuarta añade las estrategias MFA,
+   anti-replay TOTP, consumo único de `pre_auth`, códigos de respaldo y el
+   registro concurrente de intentos por reserva individual.
 2. Copie `.env.example` como `.env` y asigne secretos reales. `JWT_SECRET_KEY`,
    `TOTP_ENCRYPTION_KEY` y `AUTH_RATE_LIMIT_KEY` son secretos independientes.
    `AUTH_RATE_LIMIT_KEY` tiene al menos 32 bytes aleatorios y sirve para guardar
@@ -54,11 +57,16 @@ servidor con la clave `service_role`.
    fase 2 se mantienen; solo se restringe explícitamente su tipo de JWT.
    Tras la transición a `ACTIVE`, inicie sesión otra vez para obtener el
    `pre_auth_token` y completar el Step-Up; la activación no emite una sesión.
-5. `POST /v1/auth/verify-mfa` recibe `pre_auth_token` y `code` de seis dígitos.
-   Valida firma, `iss`, `aud`, `exp`, UUID `sub`, UUID `jti`, `token_type` y
-   `mfa_verified:false`; recupera el secreto cifrado, lo descifra únicamente en
-   backend y llama al `verify_totp()` preexistente. Al acertar responde un
-   `access_token` con `token_type: "access"` y `mfa_verified:true`.
+5. `POST /v1/auth/verify-mfa` recibe `pre_auth_token`, `method` y `code`.
+   `method` puede ser `"totp"` (valor compatible por defecto) o
+   `"backup_code"`. La estrategia TOTP recupera y descifra el secreto solo en
+   backend y llama al `verify_totp()` preexistente; la estrategia de respaldo
+   compara únicamente hashes Argon2id. Un procedimiento SQL confirma en una
+   sola transacción el factor, el contador o código consumido y el UUID `jti`.
+   Al acertar responde un `access_token` con `mfa_verified:true`.
+6. `POST /v1/auth/backup-codes` requiere `Authorization: Bearer <access_token>`
+   con MFA completo. Revoca atómicamente los códigos vigentes y devuelve diez
+   nuevos códigos de alta entropía una sola vez con `Cache-Control: no-store`.
 
 Los tres JWT contienen `sub`, `iss`, `aud`, `iat`, `exp`, `jti`, `token_type`
 y `mfa_verified`, pero son incompatibles por diseño:
@@ -77,7 +85,24 @@ no se almacenan en la base de datos. Las respuestas que devuelven tokens o el
 El Step-Up también tiene una cuota compartida de cinco verificaciones por UUID
 y bloqueo de 15 minutos (`TOTP_VERIFY_MAX_ATTEMPTS` y
 `TOTP_VERIFY_LOCK_SECONDS`). El estado de ambos límites vive en Supabase y se
-serializa con bloqueos de fila, así que se aplica entre procesos e instancias.
+serializa con bloqueos de fila. Un fallo conserva su consumo; un éxito libera
+solo su propia reserva y nunca borra los fallos o reservas concurrentes, por lo
+que el límite se aplica entre procesos e instancias.
+
+## Anti-replay y códigos de respaldo
+
+El estado TOTP guarda el mayor contador aceptado por usuario. La confirmación
+atómica rechaza el mismo contador y cualquier contador inferior, de modo que
+aceptar `C` o `C+1` también impide reutilizar una ventana anterior. El `jti` del
+`pre_auth_token` se registra junto con el consumo del factor y no puede volver
+a generar una sesión antes de que expire el JWT. Una verificación MFA inválida
+no registra ese `jti`.
+
+Los códigos de respaldo tienen 128 bits aleatorios y formato URL-safe. Se
+entregan solo en la respuesta de generación; Supabase conserva únicamente sus
+hashes Argon2id. Un código se marca usado dentro de la misma transacción que
+consume el `pre_auth`; regenerar los códigos revoca los anteriores de forma
+atómica.
 
 ## Ejemplos de cuerpos
 
@@ -93,17 +118,30 @@ POST /v1/auth/login
 
 ```json
 POST /v1/auth/verify-mfa
-{"pre_auth_token":"<token temporal>","code":"123456"}
+{"pre_auth_token":"<token temporal>","method":"totp","code":"123456"}
 ```
 
-## Limitación conocida: anti-replay pendiente
+```json
+POST /v1/auth/verify-mfa
+{"pre_auth_token":"<token temporal>","method":"backup_code","code":"<codigo-de-respaldo>"}
+```
 
-Esta fase no registra ni consume el contador TOTP validado. Por ello, durante
-la ventana TOTP aceptada, un código válido puede reutilizarse si un atacante ya
-posee un `pre_auth_token` vigente. La cuota limita intentos, pero **no es una
-protección definitiva contra replay**. La fase de anti-replay deberá almacenar
-atómicamente el último contador aceptado por usuario antes de presentar este
-Step-Up como resistente a reutilización de códigos.
+```http
+POST /v1/auth/backup-codes
+Authorization: Bearer <access_token con mfa_verified:true>
+```
 
-No se incluyen todavía códigos de respaldo, rotación de claves, QR, Prefect ni
-una interfaz gráfica.
+```json
+{"backup_codes":["<codigo-1>","<codigo-2>","..."]}
+```
+
+Guarde esa respuesta fuera de la aplicación: no existe un endpoint para volver
+a listar códigos, hashes, códigos usados o códigos revocados.
+
+## Límites pendientes
+
+No se incluyen rotación de claves, restablecimiento administrativo de MFA,
+eliminación programada de hashes históricos de respaldo, QR, Prefect ni una
+interfaz gráfica. La limpieza de `jti` expirados ocurre al confirmar MFA; para
+instalaciones con muy poca actividad puede añadirse una futura tarea operativa
+que invoque una limpieza equivalente.

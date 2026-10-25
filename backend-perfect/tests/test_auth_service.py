@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from unittest import TestCase
-from unittest.mock import patch
 from uuid import uuid4
 
 from app.auth import (
@@ -25,13 +24,14 @@ from app.auth_service import (
 from app.config import Settings
 from app.crypto import EncryptedSecret
 from app.database import (
+    AuthAttemptReservation,
     StoredPasswordUser,
     StoredTOTPConfiguration,
     VerificationAttemptPermission,
 )
+from app.mfa_strategies import MFAValidationError, MFAValidationResult
 from app.passwords import PasswordService
-from app.totp_service import ACTIVE, PENDING_VERIFICATION
-from totp import TOTPVerificationResult
+from app.totp_service import ACTIVE
 
 
 def make_settings() -> Settings:
@@ -79,17 +79,34 @@ class StubRepository:
         self.account = account
         self.configuration = configuration
         self.permission = permission or VerificationAttemptPermission(allowed=True, locked_until=None)
-        self.consume_calls: list[tuple[str, str, int, int]] = []
-        self.clear_calls: list[tuple[str, str]] = []
+        self.reservation_calls: list[tuple[str, str, int, int]] = []
+        self.completion_calls: list[tuple[object, bool]] = []
+        self.mfa_confirmation_calls: list[dict[str, object]] = []
+        self.mfa_confirmation_result = True
 
-    def consume_auth_attempt(
-        self, scope: str, subject_key: str, max_attempts: int, lock_seconds: int
-    ) -> VerificationAttemptPermission:
-        self.consume_calls.append((scope, subject_key, max_attempts, lock_seconds))
-        return self.permission
+    def reserve_auth_attempt(
+        self,
+        scope: str,
+        subject_key: str,
+        reservation_id: object,
+        max_attempts: int,
+        lock_seconds: int,
+    ) -> AuthAttemptReservation:
+        self.reservation_calls.append((scope, subject_key, max_attempts, lock_seconds))
+        if not self.permission.allowed:
+            return AuthAttemptReservation(
+                allowed=False,
+                reservation_id=None,
+                locked_until=self.permission.locked_until,
+            )
+        return AuthAttemptReservation(
+            allowed=True,
+            reservation_id=reservation_id,  # type: ignore[arg-type]
+            locked_until=None,
+        )
 
-    def clear_auth_attempts(self, scope: str, subject_key: str) -> None:
-        self.clear_calls.append((scope, subject_key))
+    def complete_auth_attempt(self, reservation_id: object, *, succeeded: bool) -> None:
+        self.completion_calls.append((reservation_id, succeeded))
 
     def get_password_user_by_email(self, email: str) -> StoredPasswordUser | None:
         return self.account
@@ -97,10 +114,21 @@ class StubRepository:
     def get_configuration(self, user_id: object) -> StoredTOTPConfiguration | None:
         return self.configuration
 
+    def confirm_mfa_step_up(self, **kwargs: object) -> bool:
+        self.mfa_confirmation_calls.append(kwargs)
+        return self.mfa_confirmation_result
 
-class StubCipher:
-    def decrypt(self, encrypted: EncryptedSecret, user_id: object) -> str:
-        return "JBSWY3DPEHPK3PXP"
+
+class StubMFAStrategy:
+    method = "totp"
+
+    def __init__(self, *, valid: bool = True) -> None:
+        self.valid = valid
+
+    def validate(self, user_id: object, credential: str) -> MFAValidationResult:
+        if not self.valid:
+            raise MFAValidationError("MFA authentication cannot be completed.")
+        return MFAValidationResult(method=self.method, totp_counter=1)
 
 
 def active_configuration(user_id: object) -> StoredTOTPConfiguration:
@@ -180,8 +208,8 @@ class PasswordLoginServiceTests(TestCase):
 
         self.assertEqual(result.user_id, user_id)
         self.assertTrue(result.requires_mfa)
-        self.assertEqual(repository.consume_calls[0][0], LOGIN_RATE_LIMIT_SCOPE)
-        self.assertEqual(repository.clear_calls[0][0], LOGIN_RATE_LIMIT_SCOPE)
+        self.assertEqual(repository.reservation_calls[0][0], LOGIN_RATE_LIMIT_SCOPE)
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [True])
 
     def test_missing_user_uses_dummy_hash_and_has_generic_failure(self) -> None:
         passwords = StubPasswords()
@@ -198,7 +226,33 @@ class PasswordLoginServiceTests(TestCase):
             service.login("missing@example.com", "incorrect")
 
         self.assertEqual(passwords.dummy_calls, 1)
-        self.assertEqual(repository.clear_calls, [])
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False])
+
+    def test_success_finalizes_only_its_own_reservation(self) -> None:
+        user_id = uuid4()
+        repository = StubRepository(
+            account=StoredPasswordUser(user_id=user_id, password_hash="stored-hash"),
+        )
+        passwords = StubPasswords()
+        service = PasswordLoginService(
+            repository,  # type: ignore[arg-type]
+            passwords,  # type: ignore[arg-type]
+            rate_limit_key=b"r" * 32,
+            max_attempts=5,
+            lock_seconds=900,
+        )
+
+        with self.assertRaises(InvalidCredentialsError):
+            service.login("person@example.com", "incorrect")
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False])
+
+        self.assertFalse(service.login("person@example.com", "correct-password").requires_mfa)
+        # The successful request finalizes only its own reservation, so a
+        # failure that raced with it remains represented in shared state.
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False, True])
+        self.assertNotEqual(
+            repository.completion_calls[0][0], repository.completion_calls[1][0]
+        )
 
     def test_locked_login_does_not_read_or_verify_password(self) -> None:
         repository = StubRepository(
@@ -220,64 +274,69 @@ class PasswordLoginServiceTests(TestCase):
 
 
 class StepUpServiceTests(TestCase):
-    def test_successful_step_up_clears_only_mfa_attempts(self) -> None:
+    def test_successful_step_up_finalizes_only_its_own_reservation(self) -> None:
         user_id = uuid4()
         repository = StubRepository(configuration=active_configuration(user_id))
         service = StepUpService(
             repository,  # type: ignore[arg-type]
-            StubCipher(),  # type: ignore[arg-type]
+            (StubMFAStrategy(),),  # type: ignore[arg-type]
             rate_limit_key=b"r" * 32,
             max_attempts=5,
             lock_seconds=900,
         )
 
-        with patch(
-            "app.auth_service.verify_totp",
-            return_value=TOTPVerificationResult(valid=True, counter=1, window=0),
-        ):
-            service.verify(user_id, "123456")
+        service.verify(
+            user_id,
+            method="totp",
+            credential="123456",
+            pre_auth_token_id=uuid4(),
+            pre_auth_expires_at=datetime.now(timezone.utc),
+        )
 
-        self.assertEqual(repository.consume_calls[0][0], MFA_RATE_LIMIT_SCOPE)
-        self.assertEqual(repository.clear_calls[0][0], MFA_RATE_LIMIT_SCOPE)
+        self.assertEqual(repository.reservation_calls[0][0], MFA_RATE_LIMIT_SCOPE)
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [True])
+        self.assertEqual(len(repository.mfa_confirmation_calls), 1)
 
-    def test_invalid_step_up_code_consumes_a_shared_attempt_without_clearing_it(self) -> None:
+    def test_invalid_step_up_code_records_a_shared_failure(self) -> None:
         user_id = uuid4()
         repository = StubRepository(configuration=active_configuration(user_id))
         service = StepUpService(
             repository,  # type: ignore[arg-type]
-            StubCipher(),  # type: ignore[arg-type]
-            rate_limit_key=b"r" * 32,
-            max_attempts=5,
-            lock_seconds=900,
-        )
-
-        with patch(
-            "app.auth_service.verify_totp",
-            return_value=TOTPVerificationResult(valid=False, counter=None, window=None),
-        ):
-            with self.assertRaises(MFAAuthenticationError):
-                service.verify(user_id, "123456")
-
-        self.assertEqual(repository.consume_calls[0][0], MFA_RATE_LIMIT_SCOPE)
-        self.assertEqual(repository.clear_calls, [])
-
-    def test_pending_totp_can_never_complete_step_up(self) -> None:
-        user_id = uuid4()
-        configuration = active_configuration(user_id)
-        configuration = StoredTOTPConfiguration(
-            user_id=configuration.user_id,
-            status=PENDING_VERIFICATION,
-            encrypted_secret=configuration.encrypted_secret,
-        )
-        repository = StubRepository(configuration=configuration)
-        service = StepUpService(
-            repository,  # type: ignore[arg-type]
-            StubCipher(),  # type: ignore[arg-type]
+            (StubMFAStrategy(valid=False),),  # type: ignore[arg-type]
             rate_limit_key=b"r" * 32,
             max_attempts=5,
             lock_seconds=900,
         )
 
         with self.assertRaises(MFAAuthenticationError):
-            service.verify(user_id, "123456")
-        self.assertEqual(repository.consume_calls, [])
+            service.verify(
+                user_id,
+                method="totp",
+                credential="123456",
+                pre_auth_token_id=uuid4(),
+                pre_auth_expires_at=datetime.now(timezone.utc),
+            )
+
+        self.assertEqual(repository.reservation_calls[0][0], MFA_RATE_LIMIT_SCOPE)
+        self.assertEqual([succeeded for _, succeeded in repository.completion_calls], [False])
+
+    def test_invalid_strategy_can_never_complete_step_up(self) -> None:
+        user_id = uuid4()
+        repository = StubRepository(configuration=active_configuration(user_id))
+        service = StepUpService(
+            repository,  # type: ignore[arg-type]
+            (StubMFAStrategy(valid=False),),  # type: ignore[arg-type]
+            rate_limit_key=b"r" * 32,
+            max_attempts=5,
+            lock_seconds=900,
+        )
+
+        with self.assertRaises(MFAAuthenticationError):
+            service.verify(
+                user_id,
+                method="totp",
+                credential="123456",
+                pre_auth_token_id=uuid4(),
+                pre_auth_expires_at=datetime.now(timezone.utc),
+            )
+        self.assertEqual(repository.reservation_calls[0][0], MFA_RATE_LIMIT_SCOPE)

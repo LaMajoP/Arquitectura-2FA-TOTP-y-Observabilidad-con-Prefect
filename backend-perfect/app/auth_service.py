@@ -6,12 +6,16 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime
-from uuid import UUID
+from typing import Iterable
+from uuid import UUID, uuid4
 
-from totp import verify_totp
-
-from .crypto import SecretDecryptionError, TOTPSecretCipher
 from .database import DatabaseError, DuplicateEmailError, SupabaseTOTPRepository
+from .mfa_strategies import (
+    MFAValidationError,
+    MFAValidationResult,
+    MFAValidationStorageError,
+    MFAValidationStrategy,
+)
 from .passwords import PasswordService
 from .totp_service import ACTIVE, PENDING_VERIFICATION
 
@@ -93,35 +97,26 @@ class PasswordLoginService:
 
     def login(self, email: str, password: str) -> LoginResult:
         subject_key = derive_rate_limit_subject(self._rate_limit_key, LOGIN_RATE_LIMIT_SCOPE, email)
-        try:
-            permission = self._repository.consume_auth_attempt(
-                LOGIN_RATE_LIMIT_SCOPE,
-                subject_key,
-                self._max_attempts,
-                self._lock_seconds,
-            )
-        except DatabaseError as exc:
-            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
-        if not permission.allowed:
-            if permission.locked_until is None:
-                raise AuthenticationStorageError("Authentication state is invalid.")
-            raise AuthenticationRateLimitError(permission.locked_until)
+        reservation_id = self._reserve_attempt(subject_key)
 
         try:
             account = self._repository.get_password_user_by_email(email)
         except DatabaseError as exc:
+            # A backend read failure did not verify an invalid credential, so
+            # release only this request's reservation without touching peers.
+            self._complete_attempt(reservation_id, succeeded=True)
             raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
 
         if account is None:
             self._passwords.verify_dummy(password)
+            self._complete_attempt(reservation_id, succeeded=False)
             raise InvalidCredentialsError("Credentials are invalid.")
         if not self._passwords.verify_password(account.password_hash, password):
+            self._complete_attempt(reservation_id, succeeded=False)
             raise InvalidCredentialsError("Credentials are invalid.")
 
-        # Only a complete successful password check clears attempts. A failed
-        # check remains reserved in Supabase across all backend instances.
+        self._complete_attempt(reservation_id, succeeded=True)
         try:
-            self._repository.clear_auth_attempts(LOGIN_RATE_LIMIT_SCOPE, subject_key)
             configuration = self._repository.get_configuration(account.user_id)
         except DatabaseError as exc:
             raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
@@ -130,61 +125,140 @@ class PasswordLoginService:
             raise AuthenticationStorageError("TOTP configuration is invalid.")
         return LoginResult(user_id=account.user_id, requires_mfa=bool(configuration and configuration.status == ACTIVE))
 
+    def _reserve_attempt(self, subject_key: str) -> UUID:
+        reservation_id = uuid4()
+        try:
+            reservation = self._repository.reserve_auth_attempt(
+                LOGIN_RATE_LIMIT_SCOPE,
+                subject_key,
+                reservation_id,
+                self._max_attempts,
+                self._lock_seconds,
+            )
+        except DatabaseError as exc:
+            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
+        if not reservation.allowed:
+            if reservation.locked_until is None:
+                raise AuthenticationStorageError("Authentication state is invalid.")
+            raise AuthenticationRateLimitError(reservation.locked_until)
+        if reservation.reservation_id is None:
+            raise AuthenticationStorageError("Authentication state is invalid.")
+        return reservation.reservation_id
+
+    def _complete_attempt(self, reservation_id: UUID, *, succeeded: bool) -> None:
+        """Finalize only this request's receipt; concurrent attempts persist."""
+        try:
+            self._repository.complete_auth_attempt(reservation_id, succeeded=succeeded)
+        except DatabaseError as exc:
+            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
+
 
 class StepUpService:
-    """Verify a TOTP code without exposing its decrypted provisioning secret."""
+    """Apply one MFA strategy, then atomically consume factor and pre-auth JTI."""
 
     def __init__(
         self,
         repository: SupabaseTOTPRepository,
-        cipher: TOTPSecretCipher,
+        strategies: Iterable[MFAValidationStrategy],
         *,
         rate_limit_key: bytes,
         max_attempts: int,
         lock_seconds: int,
     ) -> None:
         self._repository = repository
-        self._cipher = cipher
+        self._strategies = {strategy.method: strategy for strategy in strategies}
+        if len(self._strategies) < 1:
+            raise ValueError("At least one MFA validation strategy is required.")
         self._rate_limit_key = rate_limit_key
         self._max_attempts = max_attempts
         self._lock_seconds = lock_seconds
 
-    def verify(self, user_id: UUID, code: str) -> None:
-        try:
-            configuration = self._repository.get_configuration(user_id)
-        except DatabaseError as exc:
-            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
-        if configuration is None or configuration.status != ACTIVE:
-            raise MFAAuthenticationError("MFA authentication cannot be completed.")
-
+    def verify(
+        self,
+        user_id: UUID,
+        *,
+        method: str,
+        credential: str,
+        pre_auth_token_id: UUID,
+        pre_auth_expires_at: datetime,
+    ) -> None:
         subject_key = derive_rate_limit_subject(
             self._rate_limit_key, MFA_RATE_LIMIT_SCOPE, str(user_id)
         )
+        reservation_id = self._reserve_attempt(subject_key)
+
         try:
-            permission = self._repository.consume_auth_attempt(
+            strategy = self._strategies[method]
+            validation = strategy.validate(user_id, credential)
+        except KeyError as exc:
+            self._complete_attempt(reservation_id, succeeded=False)
+            raise MFAAuthenticationError("MFA authentication cannot be completed.")
+        except MFAValidationError as exc:
+            self._complete_attempt(reservation_id, succeeded=False)
+            raise MFAAuthenticationError("MFA authentication cannot be completed.") from exc
+        except MFAValidationStorageError as exc:
+            # A backend/storage error is not an invalid credential and must not
+            # consume the user's shared MFA allowance.
+            self._complete_attempt(reservation_id, succeeded=True)
+            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
+
+        self._confirm_factor_and_token(
+            user_id,
+            pre_auth_token_id,
+            pre_auth_expires_at,
+            validation,
+            reservation_id,
+        )
+
+    def _confirm_factor_and_token(
+        self,
+        user_id: UUID,
+        pre_auth_token_id: UUID,
+        pre_auth_expires_at: datetime,
+        validation: MFAValidationResult,
+        reservation_id: UUID,
+    ) -> None:
+        try:
+            confirmed = self._repository.confirm_mfa_step_up(
+                user_id=user_id,
+                pre_auth_token_id=pre_auth_token_id,
+                pre_auth_expires_at=pre_auth_expires_at,
+                method=validation.method,
+                totp_counter=validation.totp_counter,
+                backup_code_id=validation.backup_code_id,
+            )
+        except DatabaseError as exc:
+            self._complete_attempt(reservation_id, succeeded=True)
+            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
+        if not confirmed:
+            self._complete_attempt(reservation_id, succeeded=False)
+            raise MFAAuthenticationError("MFA authentication cannot be completed.")
+
+        self._complete_attempt(reservation_id, succeeded=True)
+
+    def _reserve_attempt(self, subject_key: str) -> UUID:
+        reservation_id = uuid4()
+        try:
+            reservation = self._repository.reserve_auth_attempt(
                 MFA_RATE_LIMIT_SCOPE,
                 subject_key,
+                reservation_id,
                 self._max_attempts,
                 self._lock_seconds,
             )
         except DatabaseError as exc:
             raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
-        if not permission.allowed:
-            if permission.locked_until is None:
+        if not reservation.allowed:
+            if reservation.locked_until is None:
                 raise AuthenticationStorageError("Authentication state is invalid.")
-            raise AuthenticationRateLimitError(permission.locked_until)
+            raise AuthenticationRateLimitError(reservation.locked_until)
+        if reservation.reservation_id is None:
+            raise AuthenticationStorageError("Authentication state is invalid.")
+        return reservation.reservation_id
 
+    def _complete_attempt(self, reservation_id: UUID, *, succeeded: bool) -> None:
+        """Finalize only this request's receipt; concurrent attempts persist."""
         try:
-            secret_base32 = self._cipher.decrypt(configuration.encrypted_secret, user_id)
-            verification = verify_totp(secret_base32, code)
-        except (SecretDecryptionError, TypeError, ValueError) as exc:
-            raise AuthenticationStorageError("Protected TOTP data could not be used.") from exc
-
-        if not verification.valid:
-            # The reserved row deliberately remains as a failed Step-Up check.
-            raise MFAAuthenticationError("MFA authentication cannot be completed.")
-
-        try:
-            self._repository.clear_auth_attempts(MFA_RATE_LIMIT_SCOPE, subject_key)
+            self._repository.complete_auth_attempt(reservation_id, succeeded=succeeded)
         except DatabaseError as exc:
             raise AuthenticationStorageError("Authentication storage is unavailable.") from exc

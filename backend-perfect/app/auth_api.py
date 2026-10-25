@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
-from .auth import TOKEN_TYPE_PRE_AUTH, AuthorizationError, TokenIssuer, authenticate_token
+from .auth import (
+    TOKEN_TYPE_PRE_AUTH,
+    AuthenticatedUser,
+    AuthorizationError,
+    TokenIssuer,
+    authenticate_bearer_token,
+    authenticate_token,
+)
 from .auth_service import (
     AuthenticationRateLimitError,
     AuthenticationStorageError,
@@ -23,6 +31,13 @@ from .auth_service import (
 )
 from .crypto import TOTPSecretCipher
 from .database import DatabaseError, SupabaseTOTPRepository, create_repository
+from .mfa_strategies import (
+    TOTP_METHOD,
+    BackupCodeManagementService,
+    BackupCodeStrategy,
+    MFAValidationStorageError,
+    TOTPStrategy,
+)
 from .passwords import PasswordService
 from .totp_api import get_runtime_settings, require_secure_transport
 from .config import Settings
@@ -74,13 +89,27 @@ class LoginResponse(BaseModel):
 
 class VerifyMFARequest(BaseModel):
     pre_auth_token: str = Field(min_length=1, max_length=8_192)
-    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    method: Literal["totp", "backup_code"] = TOTP_METHOD
+    code: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_method_credential(self) -> "VerifyMFARequest":
+        if self.method == TOTP_METHOD:
+            if len(self.code) != 6 or not self.code.isascii() or not self.code.isdigit():
+                raise ValueError("A TOTP code must contain exactly six digits.")
+        elif not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", self.code):
+            raise ValueError("Backup-code format is invalid.")
+        return self
 
 
 class VerifyMFAResponse(BaseModel):
     access_token: str
     token_type: Literal["Bearer"] = "Bearer"
     expires_in: int
+
+
+class BackupCodeGenerationResponse(BaseModel):
+    backup_codes: list[str] = Field(min_length=1, max_length=10)
 
 
 def _service_unavailable() -> HTTPException:
@@ -151,11 +180,34 @@ def get_step_up_service(
         raise _service_unavailable() from exc
     return StepUpService(
         repository,
-        cipher,
+        (
+            TOTPStrategy(repository, cipher),
+            BackupCodeStrategy(repository, get_password_service()),
+        ),
         rate_limit_key=settings.auth_rate_limit_key,
         max_attempts=settings.totp_verify_max_attempts,
         lock_seconds=settings.totp_verify_lock_seconds,
     )
+
+
+def get_backup_code_management_service(
+    repository: SupabaseTOTPRepository = Depends(get_auth_repository),
+) -> BackupCodeManagementService:
+    return BackupCodeManagementService(repository, get_password_service())
+
+
+def get_mfa_complete_user(
+    authorization: Annotated[str | None, Header()] = None,
+    settings: Settings = Depends(get_runtime_settings),
+) -> AuthenticatedUser:
+    try:
+        return authenticate_bearer_token(authorization, settings)
+    except AuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A valid MFA-complete bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
 
 
 @router.post(
@@ -241,9 +293,20 @@ def verify_mfa(
         )
     except AuthorizationError as exc:
         raise _authentication_failed() from exc
+    if (
+        pre_authenticated_user.token_id is None
+        or pre_authenticated_user.token_expires_at is None
+    ):
+        raise _authentication_failed()
 
     try:
-        service.verify(pre_authenticated_user.user_id, payload.code)
+        service.verify(
+            pre_authenticated_user.user_id,
+            method=payload.method,
+            credential=payload.code,
+            pre_auth_token_id=pre_authenticated_user.token_id,
+            pre_auth_expires_at=pre_authenticated_user.token_expires_at,
+        )
     except MFAAuthenticationError as exc:
         raise _authentication_failed() from exc
     except AuthenticationRateLimitError as exc:
@@ -255,3 +318,24 @@ def verify_mfa(
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return VerifyMFAResponse(access_token=issued.token, expires_in=issued.expires_in)
+
+
+@router.post(
+    "/backup-codes",
+    response_model=BackupCodeGenerationResponse,
+    dependencies=[Depends(require_secure_transport)],
+)
+def regenerate_backup_codes(
+    response: Response,
+    current_user: AuthenticatedUser = Depends(get_mfa_complete_user),
+    service: BackupCodeManagementService = Depends(get_backup_code_management_service),
+) -> BackupCodeGenerationResponse:
+    """Replace recovery codes only for the authenticated MFA-complete user."""
+    try:
+        codes = service.regenerate(current_user.user_id)
+    except MFAValidationStorageError as exc:
+        raise _service_unavailable() from exc
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return BackupCodeGenerationResponse(backup_codes=codes)
