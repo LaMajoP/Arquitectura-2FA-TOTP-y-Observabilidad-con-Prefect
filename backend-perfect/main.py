@@ -3,10 +3,12 @@
 
 from fastapi import FastAPI
 
+from app.auth_api import router as auth_router
 from app.totp_api import router as totp_router
 
 
 app = FastAPI(title="2FA Authentication API")
+app.include_router(auth_router)
 app.include_router(totp_router)
 
 

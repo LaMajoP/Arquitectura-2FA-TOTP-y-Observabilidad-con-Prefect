@@ -27,6 +27,14 @@ def _required(name: str) -> str:
     return value.strip()
 
 
+def _read_secret_bytes(name: str) -> bytes:
+    """Read a non-trivial UTF-8 secret without exposing it in errors."""
+    value = _required(name).encode("utf-8")
+    if len(value) < 32:
+        raise ConfigurationError("The TOTP service is not configured.")
+    return value
+
+
 def _read_boolean(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -75,11 +83,17 @@ class Settings:
     jwt_algorithm: str
     jwt_issuer: str
     jwt_audience: str
+    auth_rate_limit_key: bytes
     totp_encryption_key: bytes
     totp_encryption_key_version: str
     require_https: bool
     totp_verify_max_attempts: int
     totp_verify_lock_seconds: int
+    login_max_attempts: int
+    login_lock_seconds: int
+    pre_auth_token_ttl_seconds: int
+    provisioning_token_ttl_seconds: int
+    access_token_ttl_seconds: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -106,6 +120,9 @@ class Settings:
             jwt_algorithm=algorithm,
             jwt_issuer=_required("JWT_ISSUER"),
             jwt_audience=_required("JWT_AUDIENCE"),
+            # This separate HMAC key derives opaque rate-limit subjects. It
+            # prevents the shared database table from becoming an email list.
+            auth_rate_limit_key=_read_secret_bytes("AUTH_RATE_LIMIT_KEY"),
             totp_encryption_key=_decode_aes_key(_required("TOTP_ENCRYPTION_KEY")),
             totp_encryption_key_version=key_version,
             require_https=_read_boolean("TOTP_REQUIRE_HTTPS", True),
@@ -116,6 +133,21 @@ class Settings:
             ),
             totp_verify_lock_seconds=_read_bounded_positive_int(
                 "TOTP_VERIFY_LOCK_SECONDS", 900, minimum=60, maximum=86_400
+            ),
+            login_max_attempts=_read_bounded_positive_int(
+                "AUTH_LOGIN_MAX_ATTEMPTS", 5, minimum=1, maximum=20
+            ),
+            login_lock_seconds=_read_bounded_positive_int(
+                "AUTH_LOGIN_LOCK_SECONDS", 900, minimum=60, maximum=86_400
+            ),
+            pre_auth_token_ttl_seconds=_read_bounded_positive_int(
+                "AUTH_PRE_AUTH_TOKEN_TTL_SECONDS", 300, minimum=60, maximum=900
+            ),
+            provisioning_token_ttl_seconds=_read_bounded_positive_int(
+                "AUTH_PROVISIONING_TOKEN_TTL_SECONDS", 900, minimum=60, maximum=3_600
+            ),
+            access_token_ttl_seconds=_read_bounded_positive_int(
+                "AUTH_ACCESS_TOKEN_TTL_SECONDS", 3_600, minimum=300, maximum=86_400
             ),
         )
 

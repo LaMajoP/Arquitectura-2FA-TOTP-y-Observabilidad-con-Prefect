@@ -9,7 +9,12 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
-from .auth import AuthenticatedUser, AuthorizationError, authenticate_bearer_token
+from .auth import (
+    TOKEN_TYPE_PROVISIONING,
+    AuthenticatedUser,
+    AuthorizationError,
+    authenticate_bearer_token,
+)
 from .config import ConfigurationError, Settings, get_settings
 from .crypto import TOTPSecretCipher
 from .database import DatabaseError, create_repository
@@ -58,7 +63,14 @@ def get_current_user(
     settings: Settings = Depends(get_runtime_settings),
 ) -> AuthenticatedUser:
     try:
-        return authenticate_bearer_token(authorization, settings)
+        # A final access JWT is intentionally not accepted here: provisioning
+        # authority is distinct from MFA-complete session authority.
+        return authenticate_bearer_token(
+            authorization,
+            settings,
+            expected_token_type=TOKEN_TYPE_PROVISIONING,
+            expected_mfa_verified=False,
+        )
     except AuthorizationError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
