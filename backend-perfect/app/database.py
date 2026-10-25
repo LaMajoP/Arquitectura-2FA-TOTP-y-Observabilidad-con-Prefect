@@ -26,6 +26,14 @@ class StoredTOTPConfiguration:
     encrypted_secret: EncryptedSecret
 
 
+@dataclass(frozen=True, slots=True)
+class VerificationAttemptPermission:
+    """The atomic shared-state decision for one submitted verification code."""
+
+    allowed: bool
+    locked_until: datetime | None
+
+
 class SupabaseTOTPRepository:
     """Repository used exclusively by the backend service-role client."""
 
@@ -110,6 +118,53 @@ class SupabaseTOTPRepository:
         except Exception as exc:
             raise DatabaseError("Unable to activate TOTP configuration.") from exc
         return bool(response.data)
+
+    def consume_verification_attempt(
+        self, user_id: UUID, max_attempts: int, lock_seconds: int
+    ) -> VerificationAttemptPermission:
+        """Atomically reserve a code verification or report the current lock.
+
+        The database function serializes requests for a user with a row lock, so
+        this remains effective across ASGI workers and application instances.
+        """
+        try:
+            response = self._client.rpc(
+                "consume_totp_verification_attempt",
+                {
+                    "p_user_id": str(user_id),
+                    "p_max_attempts": max_attempts,
+                    "p_lock_seconds": lock_seconds,
+                },
+            ).execute()
+            rows = response.data or []
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise ValueError("Unexpected verification-attempt response.")
+
+            row = rows[0]
+            if not isinstance(row, dict) or type(row.get("allowed")) is not bool:
+                raise ValueError("Unexpected verification-attempt response.")
+
+            allowed = row["allowed"]
+            raw_locked_until = row.get("locked_until")
+            if allowed:
+                if raw_locked_until is not None:
+                    raise ValueError("Unexpected verification-attempt response.")
+                return VerificationAttemptPermission(allowed=True, locked_until=None)
+
+            if isinstance(raw_locked_until, datetime):
+                locked_until = raw_locked_until
+            elif isinstance(raw_locked_until, str):
+                locked_until = datetime.fromisoformat(raw_locked_until.replace("Z", "+00:00"))
+            else:
+                raise ValueError("Unexpected verification-attempt response.")
+            if locked_until.tzinfo is None:
+                raise ValueError("Unexpected verification-attempt response.")
+            return VerificationAttemptPermission(
+                allowed=False,
+                locked_until=locked_until.astimezone(timezone.utc),
+            )
+        except Exception as exc:
+            raise DatabaseError("Unable to record TOTP verification attempt.") from exc
 
 
 def create_repository(settings: Settings) -> SupabaseTOTPRepository:

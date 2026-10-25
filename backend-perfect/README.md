@@ -6,8 +6,9 @@ validan el primer código antes de activar su estado.
 
 ## Preparación manual
 
-1. Ejecute [`sql/001_totp_secure_storage.sql`](sql/001_totp_secure_storage.sql)
-   una vez en el SQL Editor de Supabase. Es aditivo y no usa Supabase MFA.
+1. Ejecute, en orden, [`sql/001_totp_secure_storage.sql`](sql/001_totp_secure_storage.sql)
+   y [`sql/002_totp_verify_rate_limit.sql`](sql/002_totp_verify_rate_limit.sql)
+   una vez en el SQL Editor de Supabase. Son aditivos y no usan Supabase MFA.
 2. Copie `.env.example` a `.env` y asigne valores reales. El archivo `.env` está
    ignorado por Git; no reutilice el `SUPABASE_KEY` de cliente para el backend.
 3. Genere la clave AES independiente en un entorno seguro:
@@ -43,7 +44,13 @@ Ambos requieren `Authorization: Bearer <JWT válido>` y transporte HTTPS cuando
   `409`; nunca se reemplaza un TOTP activo silenciosamente.
 - `POST /v1/totp/verify` con `{"code":"123456"}`: recupera el registro del
   usuario autenticado, lo descifra solo en memoria del backend, llama a
-  `verify_totp()` existente y hace la transición condicional a `ACTIVE`.
+  `verify_totp()` existente y hace la transición condicional a `ACTIVE`. Cada
+  usuario puede comprobar cinco códigos; después del quinto se bloquean nuevas
+  verificaciones durante 15 minutos y responden `429` con `Retry-After`. Ambos valores se pueden
+  ajustar con `TOTP_VERIFY_MAX_ATTEMPTS` y `TOTP_VERIFY_LOCK_SECONDS`. El
+  contador está en Supabase, por lo que se comparte entre procesos e instancias
+  del backend. Una sola solicitud puede completar la transición a `ACTIVE`; una
+  verificación válida concurrente que pierde la transición recibe `409`.
 
 No hay endpoint para recuperar el secreto y las respuestas de verificación no
 lo incluyen. Si se pierde esa única respuesta antes de activar la cuenta, esta

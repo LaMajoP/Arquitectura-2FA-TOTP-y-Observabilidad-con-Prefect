@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import secrets
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from totp import verify_totp
@@ -29,6 +30,14 @@ class InvalidVerificationCodeError(RuntimeError):
     """The submitted first TOTP code did not validate."""
 
 
+class VerificationRateLimitError(RuntimeError):
+    """This account temporarily exhausted its shared verification allowance."""
+
+    def __init__(self, locked_until: datetime) -> None:
+        super().__init__("TOTP verification is temporarily locked.")
+        self.locked_until = locked_until
+
+
 class SecureStorageError(RuntimeError):
     """The encrypted credential cannot safely be used."""
 
@@ -47,9 +56,18 @@ def generate_provisioning_secret() -> str:
 class TOTPActivationService:
     """Starts and confirms enrollment without exposing decrypted data externally."""
 
-    def __init__(self, repository: SupabaseTOTPRepository, cipher: TOTPSecretCipher) -> None:
+    def __init__(
+        self,
+        repository: SupabaseTOTPRepository,
+        cipher: TOTPSecretCipher,
+        *,
+        verify_max_attempts: int = 5,
+        verify_lock_seconds: int = 900,
+    ) -> None:
         self._repository = repository
         self._cipher = cipher
+        self._verify_max_attempts = verify_max_attempts
+        self._verify_lock_seconds = verify_lock_seconds
 
     def start_enrollment(self, user_id: UUID) -> EnrollmentStart:
         try:
@@ -82,6 +100,22 @@ class TOTPActivationService:
         if configuration.status != PENDING_VERIFICATION:
             raise EnrollmentConflictError("TOTP enrollment is not awaiting verification.")
 
+        # Reserve this code check before examining the code.  This is a single,
+        # row-locked database operation, rather than per-process memory, so a
+        # burst distributed across workers cannot bypass the allowance.
+        try:
+            permission = self._repository.consume_verification_attempt(
+                user_id,
+                self._verify_max_attempts,
+                self._verify_lock_seconds,
+            )
+        except DatabaseError as exc:
+            raise SecureStorageError("TOTP storage is unavailable.") from exc
+        if not permission.allowed:
+            if permission.locked_until is None:
+                raise SecureStorageError("TOTP verification state is invalid.")
+            raise VerificationRateLimitError(permission.locked_until)
+
         try:
             secret_base32 = self._cipher.decrypt(configuration.encrypted_secret, user_id)
         except SecretDecryptionError as exc:
@@ -103,12 +137,7 @@ class TOTPActivationService:
         if changed:
             return ACTIVE
 
-        # A concurrent request may have completed the same valid transition. It
-        # cannot create ACTIVE without having passed the verification above.
-        try:
-            current = self._repository.get_configuration(user_id)
-        except DatabaseError as exc:
-            raise SecureStorageError("TOTP storage is unavailable.") from exc
-        if current is not None and current.status == ACTIVE:
-            return ACTIVE
+        # A second valid request may have observed PENDING before the first
+        # transaction committed.  It did not perform the transition itself and
+        # must not receive a successful activation response.
         raise EnrollmentConflictError("TOTP enrollment state changed during verification.")

@@ -39,6 +39,20 @@ def _read_boolean(name: str, default: bool) -> bool:
     raise ConfigurationError("The TOTP service is not configured.")
 
 
+def _read_bounded_positive_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a safe operational limit without accepting unbounded values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value.strip())
+    except (AttributeError, ValueError) as exc:
+        raise ConfigurationError("The TOTP service is not configured.") from exc
+    if not minimum <= parsed <= maximum:
+        raise ConfigurationError("The TOTP service is not configured.")
+    return parsed
+
+
 def _decode_aes_key(encoded_key: str) -> bytes:
     """Decode the Base64 *representation* of a 32-byte AES key."""
     try:
@@ -64,6 +78,8 @@ class Settings:
     totp_encryption_key: bytes
     totp_encryption_key_version: str
     require_https: bool
+    totp_verify_max_attempts: int
+    totp_verify_lock_seconds: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -93,6 +109,14 @@ class Settings:
             totp_encryption_key=_decode_aes_key(_required("TOTP_ENCRYPTION_KEY")),
             totp_encryption_key_version=key_version,
             require_https=_read_boolean("TOTP_REQUIRE_HTTPS", True),
+            # These defaults allow five code checks, then block further requests
+            # for 15 minutes. Bounds avoid accidentally disabling the control.
+            totp_verify_max_attempts=_read_bounded_positive_int(
+                "TOTP_VERIFY_MAX_ATTEMPTS", 5, minimum=1, maximum=20
+            ),
+            totp_verify_lock_seconds=_read_bounded_positive_int(
+                "TOTP_VERIFY_LOCK_SECONDS", 900, minimum=60, maximum=86_400
+            ),
         )
 
 

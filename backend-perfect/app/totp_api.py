@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -17,6 +19,7 @@ from .totp_service import (
     InvalidVerificationCodeError,
     SecureStorageError,
     TOTPActivationService,
+    VerificationRateLimitError,
 )
 
 
@@ -73,7 +76,12 @@ def get_activation_service(
             settings.totp_encryption_key,
             settings.totp_encryption_key_version,
         )
-        return TOTPActivationService(repository, cipher)
+        return TOTPActivationService(
+            repository,
+            cipher,
+            verify_max_attempts=settings.totp_verify_max_attempts,
+            verify_lock_seconds=settings.totp_verify_lock_seconds,
+        )
     except (DatabaseError, ValueError) as exc:
         raise _service_unavailable() from exc
 
@@ -142,6 +150,16 @@ def verify_totp_enrollment(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The verification code is invalid.",
+        ) from exc
+    except VerificationRateLimitError as exc:
+        retry_after_seconds = max(
+            1,
+            math.ceil((exc.locked_until - datetime.now(timezone.utc)).total_seconds()),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many verification attempts. Please try again later.",
+            headers={"Retry-After": str(retry_after_seconds)},
         ) from exc
     except SecureStorageError as exc:
         raise _service_unavailable() from exc
