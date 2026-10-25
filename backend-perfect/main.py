@@ -35,3 +35,4 @@ def root() -> dict[str, str]:
 def health() -> dict[str, str]:
     """Health check intentionally does not require external credentials."""
     return {"status": "ok"}
+
