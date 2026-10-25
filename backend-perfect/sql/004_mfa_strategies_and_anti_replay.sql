@@ -104,7 +104,7 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     attempt_state public.auth_rate_limit_attempts%ROWTYPE;
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
     new_locked_until timestamptz;
 BEGIN
     IF p_scope NOT IN ('LOGIN', 'MFA')
@@ -125,7 +125,7 @@ BEGIN
     FOR UPDATE;
 
     IF attempt_state.locked_until IS NOT NULL
-       AND attempt_state.locked_until > current_time THEN
+       AND attempt_state.locked_until > v_now THEN
         RETURN QUERY SELECT false, NULL::uuid, attempt_state.locked_until;
         RETURN;
     END IF;
@@ -139,18 +139,18 @@ BEGIN
     END IF;
 
     IF attempt_state.attempt_count >= p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
         UPDATE public.auth_rate_limit_attempts
         SET locked_until = new_locked_until,
             lock_reservation_id = NULL,
-            updated_at = current_time
+            updated_at = v_now
         WHERE scope = p_scope AND subject_key = p_subject_key;
         RETURN QUERY SELECT false, NULL::uuid, new_locked_until;
         RETURN;
     END IF;
 
     IF attempt_state.attempt_count + 1 = p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
     ELSE
         new_locked_until := NULL;
     END IF;
@@ -162,7 +162,7 @@ BEGIN
             WHEN new_locked_until IS NULL THEN NULL
             ELSE p_reservation_id
         END,
-        updated_at = current_time
+        updated_at = v_now
     WHERE scope = p_scope AND subject_key = p_subject_key;
 
     INSERT INTO public.auth_rate_limit_reservations (reservation_id, scope, subject_key)
@@ -187,7 +187,7 @@ AS $$
 DECLARE
     reservation_state public.auth_rate_limit_reservations%ROWTYPE;
     attempt_state public.auth_rate_limit_attempts%ROWTYPE;
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
 BEGIN
     IF p_reservation_id IS NULL OR p_succeeded IS NULL THEN
         RAISE EXCEPTION 'Invalid authentication rate-limit input';
@@ -226,7 +226,7 @@ BEGIN
                 WHEN attempt_state.lock_reservation_id = p_reservation_id THEN NULL
                 ELSE attempt_state.lock_reservation_id
             END,
-            updated_at = current_time
+            updated_at = v_now
         WHERE scope = reservation_state.scope
           AND subject_key = reservation_state.subject_key;
     END IF;
@@ -245,7 +245,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
 BEGIN
     IF p_user_id IS NULL
        OR cardinality(p_code_hashes) NOT BETWEEN 1 AND 10
@@ -267,7 +267,7 @@ BEGIN
     END IF;
 
     UPDATE public.backup_codes
-    SET revoked_at = current_time
+    SET revoked_at = v_now
     WHERE user_id = p_user_id
       AND used_at IS NULL
       AND revoked_at IS NULL;
@@ -298,12 +298,12 @@ AS $$
 DECLARE
     replay_state public.totp_mfa_replay_state%ROWTYPE;
     backup_code public.backup_codes%ROWTYPE;
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
 BEGIN
     IF p_user_id IS NULL
        OR p_pre_auth_jti IS NULL
        OR p_pre_auth_expires_at IS NULL
-       OR p_pre_auth_expires_at <= current_time
+       OR p_pre_auth_expires_at <= v_now
        OR p_method NOT IN ('totp', 'backup_code') THEN
         RETURN QUERY SELECT false;
         RETURN;
@@ -311,7 +311,7 @@ BEGIN
 
     -- Never delete a consumed JTI before its own token expiry.
     DELETE FROM public.pre_auth_token_consumptions
-    WHERE expires_at <= current_time;
+    WHERE expires_at <= v_now;
 
     IF p_method = 'totp' THEN
         IF p_totp_counter IS NULL OR p_totp_counter < 0 OR p_backup_code_id IS NOT NULL THEN
@@ -344,7 +344,7 @@ BEGIN
 
         UPDATE public.totp_mfa_replay_state
         SET last_accepted_counter = p_totp_counter,
-            updated_at = current_time
+            updated_at = v_now
         WHERE user_id = p_user_id;
 
         RETURN QUERY SELECT true;
@@ -377,7 +377,7 @@ BEGIN
     END IF;
 
     UPDATE public.backup_codes
-    SET used_at = current_time
+    SET used_at = v_now
     WHERE id = backup_code.id;
 
     RETURN QUERY SELECT true;

@@ -19,7 +19,7 @@ if cors_allowed_origins:
         allow_origins=list(cors_allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "Cache-Control"],
         max_age=600,
     )
 app.include_router(auth_router)

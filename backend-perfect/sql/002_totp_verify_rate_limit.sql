@@ -31,7 +31,7 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     attempt_state public.totp_verification_attempts%ROWTYPE;
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
     new_locked_until timestamptz;
 BEGIN
     IF p_max_attempts NOT BETWEEN 1 AND 20
@@ -50,7 +50,7 @@ BEGIN
     FOR UPDATE;
 
     IF attempt_state.locked_until IS NOT NULL
-       AND attempt_state.locked_until > current_time THEN
+       AND attempt_state.locked_until > v_now THEN
         RETURN QUERY SELECT false, attempt_state.locked_until;
         RETURN;
     END IF;
@@ -63,10 +63,10 @@ BEGIN
     -- This is only reachable if a prior inconsistent row has the maximum count
     -- without a lock. Recover safely by beginning a lock without a code check.
     IF attempt_state.attempt_count >= p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
         UPDATE public.totp_verification_attempts
         SET locked_until = new_locked_until,
-            updated_at = current_time
+            updated_at = v_now
         WHERE user_id = p_user_id;
 
         RETURN QUERY SELECT false, new_locked_until;
@@ -77,7 +77,7 @@ BEGIN
     -- the last one, begin the lock now so parallel later requests cannot also
     -- inspect their code. Its successful response still remains possible.
     IF attempt_state.attempt_count + 1 = p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
     ELSE
         new_locked_until := NULL;
     END IF;
@@ -85,7 +85,7 @@ BEGIN
     UPDATE public.totp_verification_attempts
     SET attempt_count = attempt_state.attempt_count + 1,
         locked_until = new_locked_until,
-        updated_at = current_time
+        updated_at = v_now
     WHERE user_id = p_user_id;
 
     RETURN QUERY SELECT true, NULL::timestamptz;

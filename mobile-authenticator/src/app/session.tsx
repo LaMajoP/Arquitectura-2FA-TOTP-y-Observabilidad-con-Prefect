@@ -1,5 +1,5 @@
 import { router } from "expo-router";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import { AuthScreen, Body, Card, Heading, Notice, PrimaryButton, SecondaryButton, colors } from "../components/auth-ui";
@@ -11,10 +11,6 @@ export default function AuthenticatedSessionScreen() {
   const [codes, setCodes] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    if (!session.accessToken) router.replace("/login");
-  }, [session.accessToken]);
 
   async function createBackupCodes(): Promise<void> {
     if (!session.accessToken) return;
@@ -32,6 +28,18 @@ export default function AuthenticatedSessionScreen() {
     } finally {
       setLoading(false);
     }
+  }
+
+  if (!session.accessToken) {
+    return (
+      <AuthScreen>
+        <Card>
+          <Heading>Sesión no disponible</Heading>
+          <Body>No hay una sesión autenticada activa.</Body>
+          <PrimaryButton onPress={() => router.replace("/login")}>Iniciar sesión</PrimaryButton>
+        </Card>
+      </AuthScreen>
+    );
   }
 
   return (

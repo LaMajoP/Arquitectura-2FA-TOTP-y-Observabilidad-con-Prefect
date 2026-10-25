@@ -75,7 +75,7 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     attempt_state public.auth_rate_limit_attempts%ROWTYPE;
-    current_time timestamptz := clock_timestamp();
+    v_now timestamptz := clock_timestamp();
     new_locked_until timestamptz;
 BEGIN
     IF p_scope NOT IN ('LOGIN', 'MFA')
@@ -96,7 +96,7 @@ BEGIN
     FOR UPDATE;
 
     IF attempt_state.locked_until IS NOT NULL
-       AND attempt_state.locked_until > current_time THEN
+       AND attempt_state.locked_until > v_now THEN
         RETURN QUERY SELECT false, attempt_state.locked_until;
         RETURN;
     END IF;
@@ -106,17 +106,17 @@ BEGIN
     END IF;
 
     IF attempt_state.attempt_count >= p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
         UPDATE public.auth_rate_limit_attempts
         SET locked_until = new_locked_until,
-            updated_at = current_time
+            updated_at = v_now
         WHERE scope = p_scope AND subject_key = p_subject_key;
         RETURN QUERY SELECT false, new_locked_until;
         RETURN;
     END IF;
 
     IF attempt_state.attempt_count + 1 = p_max_attempts THEN
-        new_locked_until := current_time + make_interval(secs => p_lock_seconds);
+        new_locked_until := v_now + make_interval(secs => p_lock_seconds);
     ELSE
         new_locked_until := NULL;
     END IF;
@@ -124,7 +124,7 @@ BEGIN
     UPDATE public.auth_rate_limit_attempts
     SET attempt_count = attempt_state.attempt_count + 1,
         locked_until = new_locked_until,
-        updated_at = current_time
+        updated_at = v_now
     WHERE scope = p_scope AND subject_key = p_subject_key;
 
     RETURN QUERY SELECT true, NULL::timestamptz;

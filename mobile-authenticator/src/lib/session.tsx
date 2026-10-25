@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
 
 type AuthSession = {
   email: string | null;
@@ -24,37 +24,56 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [preAuthToken, setPreAuthToken] = useState<string | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
 
+  const setProvisioningSession = useCallback((nextEmail: string, token: string) => {
+    setEmail(nextEmail);
+    setProvisioningToken(token);
+    setPreAuthToken(null);
+    setAccessToken(null);
+  }, []);
+
+  const setPreAuthSession = useCallback((nextEmail: string, token: string) => {
+    setEmail(nextEmail);
+    setPreAuthToken(token);
+    setProvisioningToken(null);
+    setAccessToken(null);
+  }, []);
+
+  const setAccessSession = useCallback((token: string) => {
+    // `verifyMfa` supplies the access JWT. Set it before revoking the
+    // transitional authorities so routing always has an authenticated state.
+    setAccessToken(token);
+    setProvisioningToken(null);
+    setPreAuthToken(null);
+  }, []);
+
+  const clearSession = useCallback(() => {
+    setEmail(null);
+    setProvisioningToken(null);
+    setPreAuthToken(null);
+    setAccessToken(null);
+  }, []);
+
   const value = useMemo<AuthSession>(
     () => ({
       email,
       provisioningToken,
       preAuthToken,
       accessToken,
-      setProvisioningSession: (nextEmail, token) => {
-        setEmail(nextEmail);
-        setProvisioningToken(token);
-        setPreAuthToken(null);
-        setAccessToken(null);
-      },
-      setPreAuthSession: (nextEmail, token) => {
-        setEmail(nextEmail);
-        setPreAuthToken(token);
-        setProvisioningToken(null);
-        setAccessToken(null);
-      },
-      setAccessSession: (token) => {
-        setAccessToken(token);
-        setProvisioningToken(null);
-        setPreAuthToken(null);
-      },
-      clearSession: () => {
-        setEmail(null);
-        setProvisioningToken(null);
-        setPreAuthToken(null);
-        setAccessToken(null);
-      },
+      setProvisioningSession,
+      setPreAuthSession,
+      setAccessSession,
+      clearSession,
     }),
-    [accessToken, email, preAuthToken, provisioningToken],
+    [
+      accessToken,
+      clearSession,
+      email,
+      preAuthToken,
+      provisioningToken,
+      setAccessSession,
+      setPreAuthSession,
+      setProvisioningSession,
+    ],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
