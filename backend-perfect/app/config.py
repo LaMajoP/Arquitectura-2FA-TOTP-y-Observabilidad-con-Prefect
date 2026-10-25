@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -45,6 +46,38 @@ def _read_boolean(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no"}:
         return False
     raise ConfigurationError("The TOTP service is not configured.")
+
+
+def _read_choice(name: str, default: str, *, allowed: frozenset[str]) -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value not in allowed:
+        raise ConfigurationError("The TOTP service is not configured.")
+    return value
+
+
+def get_cors_allowed_origins() -> tuple[str, ...]:
+    """Read public browser origins without loading or validating server secrets."""
+    load_dotenv(_ENV_FILE, override=False)
+    origins = tuple(
+        part.strip().rstrip("/")
+        for part in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+        if part.strip()
+    )
+    for origin in origins:
+        parsed = urlparse(origin)
+        if (
+            origin == "*"
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise ConfigurationError("The TOTP service is not configured.")
+    return origins
 
 
 def _read_bounded_positive_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -95,6 +128,7 @@ class Settings:
     provisioning_token_ttl_seconds: int
     access_token_ttl_seconds: int
     backup_code_recent_mfa_seconds: int
+    prefect_mfa_failure_mode: str
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -152,6 +186,11 @@ class Settings:
             ),
             backup_code_recent_mfa_seconds=_read_bounded_positive_int(
                 "AUTH_BACKUP_CODE_RECENT_MFA_SECONDS", 300, minimum=60, maximum=900
+            ),
+            prefect_mfa_failure_mode=_read_choice(
+                "PREFECT_MFA_FAILURE_MODE",
+                "fail_closed",
+                allowed=frozenset({"fail_closed", "direct_fallback"}),
             ),
         )
 

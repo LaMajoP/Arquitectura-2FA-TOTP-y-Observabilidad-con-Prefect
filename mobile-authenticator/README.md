@@ -1,56 +1,75 @@
-# Welcome to your Expo app 👋
+# Cliente Expo: TOTP, QR y Step-Up MFA
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Esta aplicación Expo Router usa el backend FastAPI real; no contiene una clave
+de Supabase ni implementa otro algoritmo TOTP. El cálculo offline reutiliza
+`src/artifacts/totp/` sin modificarlo.
 
-## Get started
+## Pantallas y flujo
 
-1. Install dependencies
+- `/register`: correo, contraseña, confirmación y validación local básica.
+- `/login`: recibe un `provisioning_token` o `pre_auth_token` temporal y lo
+  mantiene solo en memoria.
+- `/totp-setup`: solicita la inscripción, muestra QR `otpauth://` y secreto
+  Base32 una sola vez, y confirma el primer código contra el backend.
+- `/authenticator`: importa una cuenta por QR o Base32 y genera TOTP offline.
+- `/mfa-verify`: permite seleccionar `totp` o `backup_code` y llama a
+  `/v1/auth/verify-mfa`.
+- `/session`: confirma MFA, permite cerrar sesión y generar los diez códigos de
+  respaldo durante la ventana de autenticación reciente.
+
+El cliente transforma de manera genérica las respuestas `400`, `401`, `409`,
+`422`, `429` y `503`; no presenta detalles que ayuden a enumerar cuentas,
+códigos, tokens o estados internos.
+
+## QR, escaneo y almacenamiento
+
+El QR se genera en el dispositivo con `react-native-qrcode-svg`; su URI incluye
+emisor, nombre de cuenta, secreto, `SHA1`, seis dígitos y período de 30 segundos.
+No se utiliza una API externa para convertir secretos en imágenes. El escáner
+con `expo-camera` pide permiso de cámara al usarlo y acepta únicamente URIs
+`otpauth://totp` de esos mismos parámetros.
+
+En Android e iOS, las semillas del Authenticator se cifran en el almacén seguro
+del dispositivo mediante `expo-secure-store`. En web, por diseño, las semillas
+solo viven en memoria y se eliminan al recargar/cerrar la pestaña: no se usan
+`localStorage`, `sessionStorage`, IndexedDB ni cookies. Contraseñas y tokens de
+sesión también se mantienen en memoria, por lo que un reinicio obliga a
+autenticarse nuevamente.
+
+## Configuración y ejecución
+
+1. Desde `mobile-authenticator`, copie `.env.example` como `.env` y configure
+   `EXPO_PUBLIC_API_URL`. Es una URL pública, nunca una clave.
+2. Instale versiones compatibles con Expo SDK 58:
 
    ```bash
-   npm install
+   npx expo install expo-camera expo-secure-store react-native-svg react-native-qrcode-svg
    ```
 
-2. Start the app
+3. Inicie la aplicación:
 
    ```bash
    npx expo start
    ```
 
-In the output, you'll find options to open the app in a
+   Use `npx expo start --web` para el navegador. Para un emulador Android use
+   `http://10.0.2.2:8000` como URL de desarrollo; para un dispositivo físico
+   use la IP LAN del equipo solo en una red de desarrollo de confianza. En
+   producción la URL debe ser HTTPS.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+Para permitir la aplicación web, configure en el backend una lista exacta de
+orígenes, por ejemplo `CORS_ALLOWED_ORIGINS=http://localhost:8081`. No use `*`.
+En desarrollo local HTTP, el backend debe tener `TOTP_REQUIRE_HTTPS=false`;
+manténgalo en `true` en todo entorno desplegado.
 
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+La cámara se configura mediante el plugin de Expo en `app.json`. Tras agregar
+el módulo a un binario ya instalado, cree una nueva development build o use el
+flujo de Expo apropiado para que la configuración nativa de permisos se aplique.
 
-## Get a fresh project
+## Límites conocidos
 
-When you're ready, run:
-
-```bash
-npm run reset-project
-```
-
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
-
-### Other setup steps
-
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+La interfaz no sustituye pruebas de integración: fases 2–4 siguen pendientes de
+validación real con Supabase. La app no muestra ni recupera códigos de respaldo
+una segunda vez, no persiste sesiones y no implementa exportación de semillas.
+Un usuario debe mantener la hora del dispositivo razonablemente sincronizada
+para que los códigos offline coincidan con el backend.

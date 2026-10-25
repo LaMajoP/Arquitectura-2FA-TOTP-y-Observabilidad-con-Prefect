@@ -12,18 +12,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from .auth import (
-    TOKEN_TYPE_PRE_AUTH,
     AuthenticatedUser,
     AuthorizationError,
     TokenIssuer,
     authenticate_bearer_token,
-    authenticate_token,
 )
 from .auth_service import (
     AuthenticationRateLimitError,
     AuthenticationStorageError,
     InvalidCredentialsError,
-    MFAAuthenticationError,
     PasswordLoginService,
     RegistrationConflictError,
     RegistrationService,
@@ -39,6 +36,13 @@ from .mfa_strategies import (
     TOTPStrategy,
 )
 from .passwords import PasswordService
+from .prefect_mfa import (
+    MFAFlowAuthenticationError,
+    MFAFlowOrchestrator,
+    MFAFlowRateLimitError,
+    MFAFlowStorageError,
+    PrefectMFAUnavailableError,
+)
 from .totp_api import get_runtime_settings, require_secure_transport
 from .config import Settings
 
@@ -196,6 +200,14 @@ def get_backup_code_management_service(
     return BackupCodeManagementService(repository, get_password_service())
 
 
+def get_mfa_flow_orchestrator(
+    settings: Settings = Depends(get_runtime_settings),
+    repository: SupabaseTOTPRepository = Depends(get_auth_repository),
+    step_up_service: StepUpService = Depends(get_step_up_service),
+) -> MFAFlowOrchestrator:
+    return MFAFlowOrchestrator(settings, repository, step_up_service)
+
+
 def get_recent_mfa_complete_user(
     authorization: Annotated[str | None, Header()] = None,
     settings: Settings = Depends(get_runtime_settings),
@@ -290,40 +302,21 @@ def login(
 def verify_mfa(
     payload: VerifyMFARequest,
     response: Response,
-    settings: Settings = Depends(get_runtime_settings),
-    service: StepUpService = Depends(get_step_up_service),
+    orchestrator: MFAFlowOrchestrator = Depends(get_mfa_flow_orchestrator),
 ) -> VerifyMFAResponse:
     try:
-        pre_authenticated_user = authenticate_token(
-            payload.pre_auth_token,
-            settings,
-            expected_token_type=TOKEN_TYPE_PRE_AUTH,
-            expected_mfa_verified=False,
-        )
-    except AuthorizationError as exc:
-        raise _authentication_failed() from exc
-    if (
-        pre_authenticated_user.token_id is None
-        or pre_authenticated_user.token_expires_at is None
-    ):
-        raise _authentication_failed()
-
-    try:
-        service.verify(
-            pre_authenticated_user.user_id,
+        issued = orchestrator.complete(
+            pre_auth_token=payload.pre_auth_token,
             method=payload.method,
             credential=payload.code,
-            pre_auth_token_id=pre_authenticated_user.token_id,
-            pre_auth_expires_at=pre_authenticated_user.token_expires_at,
         )
-    except MFAAuthenticationError as exc:
+    except MFAFlowAuthenticationError as exc:
         raise _authentication_failed() from exc
-    except AuthenticationRateLimitError as exc:
-        raise _rate_limited(exc) from exc
-    except AuthenticationStorageError as exc:
+    except MFAFlowRateLimitError as exc:
+        raise _rate_limited(AuthenticationRateLimitError(exc.locked_until)) from exc
+    except (MFAFlowStorageError, PrefectMFAUnavailableError) as exc:
         raise _service_unavailable() from exc
 
-    issued = TokenIssuer(settings).issue_access_token(pre_authenticated_user.user_id)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return VerifyMFAResponse(access_token=issued.token, expires_in=issued.expires_in)

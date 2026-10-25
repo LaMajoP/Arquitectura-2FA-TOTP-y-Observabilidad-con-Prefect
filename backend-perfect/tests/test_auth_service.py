@@ -54,6 +54,7 @@ def make_settings() -> Settings:
         provisioning_token_ttl_seconds=900,
         access_token_ttl_seconds=3600,
         backup_code_recent_mfa_seconds=300,
+        prefect_mfa_failure_mode="fail_closed",
     )
 
 

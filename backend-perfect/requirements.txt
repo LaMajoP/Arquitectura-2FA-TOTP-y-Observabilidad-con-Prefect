@@ -6,3 +6,4 @@ PyJWT>=2.8
 python-dotenv>=1.0
 argon2-cffi>=23.1
 email-validator>=2.1
+prefect>=3.0,<4.0

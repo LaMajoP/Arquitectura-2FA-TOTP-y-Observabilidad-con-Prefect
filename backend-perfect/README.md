@@ -109,6 +109,78 @@ hashes Argon2id. Un código se marca usado dentro de la misma transacción que
 consume el `pre_auth`; regenerar los códigos revoca los anteriores de forma
 atómica.
 
+## Prefect: flujo MFA observable
+
+`POST /v1/auth/verify-mfa` ejecuta el flujo real `mfa_step_up`, no una copia de
+demostración. El flujo se ejecuta en el mismo proceso del backend y conserva la
+autoridad de seguridad en los servicios y funciones SQL existentes:
+
+1. `validate_pre_auth_state` valida firma, caducidad, emisor, audiencia,
+   propósito `pre_auth` y `mfa_verified:false`.
+2. `check_anti_replay_cache` consulta el estado persistido de consumo de `jti`
+   como señal de observación. Es intencionalmente solo orientativo: la función
+   SQL de confirmación es la única autoridad para evitar carreras.
+3. `execute_mfa_strategy` invoca la estrategia TOTP o `backup_code` existente.
+   La estrategia y `confirm_mfa_step_up` mantienen en una transacción el
+   consumo de contador/código, el `jti` y la reserva de límite de intentos.
+4. `issue_elevated_session` firma el JWT `access` únicamente después de esa
+   confirmación atómica.
+
+Todas las tareas y el flow llevan `retries=0`. Un secreto, código, JWT,
+contraseña o UUID de usuario no es argumento ni resultado de Prefect: el único
+argumento es un UUID de correlación aleatorio. El contexto sensible vive solo
+en memoria durante la solicitud y se elimina al terminar. Los resultados que
+Prefect puede ver son estados seguros (`ok`, `authentication_failed`,
+`rate_limited` o `storage_error`). Esto hace que una reiniciación del backend no
+deje una sesión parcial en memoria: una petición posterior vuelve a validar el
+JWT y el estado persistido de Supabase.
+
+Los eventos JSON estructurados se emiten en el logger `mfa.observability` y en
+el run de Prefect: `mfa_authentication_started`, `mfa_verification_succeeded`,
+`mfa_code_invalid`, `mfa_totp_replay_detected`, `mfa_pre_auth_reused`,
+`mfa_rate_limit_reached`, `mfa_supabase_error`, `mfa_prefect_unavailable` y
+`mfa_flow_finished` (incluye `duration_ms`). Llevan `correlation_id` y método,
+pero no correo, token, secreto o código. Los detalles de replay se usan solo
+para observabilidad; la respuesta HTTP sigue siendo genérica.
+
+Por defecto `PREFECT_MFA_FAILURE_MODE=fail_closed`: si la orquestación no puede
+iniciar o ejecutar el flow, `/verify-mfa` responde `503` y no habilita acceso.
+`direct_fallback` es una decisión explícita de disponibilidad; usa exactamente
+la misma validación JWT, `StepUpService` y confirmación SQL, sin observabilidad
+de Prefect. Ninguno de los dos modos puede emitir dos sesiones: si el error
+ocurre después de confirmar SQL, el factor o `jti` puede quedar consumido y el
+cliente debe iniciar login otra vez. Ese comportamiento conservador evita
+debilitar el anti-replay.
+
+Para desarrollo local reproducible, en terminales separados:
+
+```bash
+cd backend-perfect
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+prefect server start
+```
+
+```bash
+cd backend-perfect
+source .venv/bin/activate
+export PREFECT_API_URL=http://127.0.0.1:4200/api
+uvicorn main:app --reload
+```
+
+Abra `http://127.0.0.1:4200` para consultar flow runs, task runs, duración,
+estado y errores. No se usa un deployment ni worker remoto: el registro de
+contexto seguro es deliberadamente local al proceso web. Si no se configura un
+servidor Prefect, la instalación de Prefect puede usar su modo efímero, pero no
+hay una consola local durable; para inspección se debe iniciar `prefect server`.
+No se requiere AWS ni infraestructura de pago.
+
+La interfaz web necesita una lista de orígenes CORS explícitos mediante
+`CORS_ALLOWED_ORIGINS`, por ejemplo `http://localhost:8081`. El backend no
+habilita CORS cuando la variable está vacía y rechaza `*`, rutas o esquemas
+distintos de HTTP(S). Las aplicaciones Android/iOS nativas no dependen de CORS.
+
 ## Ejemplos de cuerpos
 
 ```json
@@ -145,8 +217,9 @@ a listar códigos, hashes, códigos usados o códigos revocados.
 
 ## Límites pendientes
 
-No se incluyen rotación de claves, restablecimiento administrativo de MFA,
-eliminación programada de hashes históricos de respaldo, QR, Prefect ni una
-interfaz gráfica. La limpieza de `jti` expirados ocurre al confirmar MFA; para
-instalaciones con muy poca actividad puede añadirse una futura tarea operativa
-que invoque una limpieza equivalente.
+No se incluyen rotación de claves, restablecimiento administrativo de MFA ni
+eliminación programada de hashes históricos de respaldo. La limpieza de `jti`
+expirados ocurre al confirmar MFA; para instalaciones con muy poca actividad
+puede añadirse una futura tarea operativa que invoque una limpieza equivalente.
+Prefect mejora trazabilidad, pero no sustituye métricas, alertas, retención de
+logs ni pruebas de integración reales con Supabase.

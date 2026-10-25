@@ -36,6 +36,14 @@ class MFAAuthenticationError(RuntimeError):
     """The Step-Up attempt cannot complete without exposing the reason."""
 
 
+class MFAReplayDetectedError(MFAAuthenticationError):
+    """A TOTP counter already consumed by this account was submitted again."""
+
+
+class PreAuthTokenReusedError(MFAAuthenticationError):
+    """A previously consumed pre-auth JTI was submitted again."""
+
+
 class AuthenticationRateLimitError(RuntimeError):
     """A shared login or Step-Up allowance is temporarily exhausted."""
 
@@ -232,9 +240,28 @@ class StepUpService:
             raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
         if not confirmed:
             self._complete_attempt(reservation_id, succeeded=False)
-            raise MFAAuthenticationError("MFA authentication cannot be completed.")
+            self._raise_confirmation_failure(user_id, pre_auth_token_id, validation)
 
         self._complete_attempt(reservation_id, succeeded=True)
+
+    def _raise_confirmation_failure(
+        self,
+        user_id: UUID,
+        pre_auth_token_id: UUID,
+        validation: MFAValidationResult,
+    ) -> None:
+        """Classify a failed atomic confirmation only for internal telemetry."""
+        try:
+            if self._repository.is_pre_auth_token_consumed(user_id, pre_auth_token_id):
+                raise PreAuthTokenReusedError("MFA authentication cannot be completed.")
+            if (
+                validation.totp_counter is not None
+                and self._repository.is_totp_counter_consumed(user_id, validation.totp_counter)
+            ):
+                raise MFAReplayDetectedError("MFA authentication cannot be completed.")
+        except DatabaseError as exc:
+            raise AuthenticationStorageError("Authentication storage is unavailable.") from exc
+        raise MFAAuthenticationError("MFA authentication cannot be completed.")
 
     def _reserve_attempt(self, subject_key: str) -> UUID:
         reservation_id = uuid4()

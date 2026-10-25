@@ -224,6 +224,39 @@ class SupabaseTOTPRepository:
         except Exception as exc:
             raise DatabaseError("Unable to confirm MFA authentication.") from exc
 
+    def is_pre_auth_token_consumed(self, user_id: UUID, token_id: UUID) -> bool:
+        """Read an advisory replay signal; the SQL confirmation remains authoritative."""
+        try:
+            response = (
+                self._client.table("pre_auth_token_consumptions")
+                .select("jti")
+                .eq("jti", str(token_id))
+                .eq("user_id", str(user_id))
+                .limit(1)
+                .execute()
+            )
+            return bool(response.data)
+        except Exception as exc:
+            raise DatabaseError("Unable to inspect pre-auth token state.") from exc
+
+    def is_totp_counter_consumed(self, user_id: UUID, counter: int) -> bool:
+        """Read an advisory counter state for safe observability classification."""
+        try:
+            response = (
+                self._client.table("totp_mfa_replay_state")
+                .select("last_accepted_counter")
+                .eq("user_id", str(user_id))
+                .limit(1)
+                .execute()
+            )
+            rows = response.data or []
+            if not rows:
+                return False
+            stored_counter = rows[0].get("last_accepted_counter")
+            return isinstance(stored_counter, int) and counter <= stored_counter
+        except Exception as exc:
+            raise DatabaseError("Unable to inspect TOTP replay state.") from exc
+
     def ensure_user(self, user_id: UUID) -> None:
         try:
             self._client.table(self._USERS_TABLE).upsert(
