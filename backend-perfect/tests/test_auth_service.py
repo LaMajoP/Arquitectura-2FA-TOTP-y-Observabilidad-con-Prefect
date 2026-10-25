@@ -53,6 +53,7 @@ def make_settings() -> Settings:
         pre_auth_token_ttl_seconds=300,
         provisioning_token_ttl_seconds=900,
         access_token_ttl_seconds=3600,
+        backup_code_recent_mfa_seconds=300,
     )
 
 

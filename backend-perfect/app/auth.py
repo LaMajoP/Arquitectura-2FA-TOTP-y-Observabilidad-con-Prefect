@@ -31,6 +31,7 @@ class AuthenticatedUser:
     token_type: str = TOKEN_TYPE_ACCESS
     mfa_verified: bool = True
     token_id: UUID | None = None
+    token_issued_at: datetime | None = None
     token_expires_at: datetime | None = None
 
 
@@ -157,6 +158,7 @@ def authenticate_token(
             or type(expiration) is not int
         ):
             raise ValueError("JWT authorization claims are invalid.")
+        token_issued_at = datetime.fromtimestamp(issued_at, timezone.utc)
         token_expires_at = datetime.fromtimestamp(expiration, timezone.utc)
     except (InvalidTokenError, KeyError, OSError, OverflowError, TypeError, ValueError) as exc:
         raise AuthorizationError("The token is invalid, expired, or unsuitable.") from exc
@@ -166,6 +168,7 @@ def authenticate_token(
         token_type=token_type,
         mfa_verified=mfa_verified,
         token_id=token_id,
+        token_issued_at=token_issued_at,
         token_expires_at=token_expires_at,
     )
 

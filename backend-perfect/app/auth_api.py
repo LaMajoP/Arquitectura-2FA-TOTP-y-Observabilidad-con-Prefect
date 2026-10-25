@@ -196,18 +196,27 @@ def get_backup_code_management_service(
     return BackupCodeManagementService(repository, get_password_service())
 
 
-def get_mfa_complete_user(
+def get_recent_mfa_complete_user(
     authorization: Annotated[str | None, Header()] = None,
     settings: Settings = Depends(get_runtime_settings),
 ) -> AuthenticatedUser:
     try:
-        return authenticate_bearer_token(authorization, settings)
+        current_user = authenticate_bearer_token(authorization, settings)
     except AuthorizationError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="A valid MFA-complete bearer token is required.",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+    if current_user.token_issued_at is None or (
+        datetime.now(timezone.utc) - current_user.token_issued_at
+    ).total_seconds() > settings.backup_code_recent_mfa_seconds:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A recent MFA verification is required to replace backup codes.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user
 
 
 @router.post(
@@ -327,7 +336,7 @@ def verify_mfa(
 )
 def regenerate_backup_codes(
     response: Response,
-    current_user: AuthenticatedUser = Depends(get_mfa_complete_user),
+    current_user: AuthenticatedUser = Depends(get_recent_mfa_complete_user),
     service: BackupCodeManagementService = Depends(get_backup_code_management_service),
 ) -> BackupCodeGenerationResponse:
     """Replace recovery codes only for the authenticated MFA-complete user."""

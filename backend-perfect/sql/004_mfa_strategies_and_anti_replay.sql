@@ -24,6 +24,12 @@ ALTER TABLE public.auth_rate_limit_reservations ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.auth_rate_limit_reservations FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, DELETE ON TABLE public.auth_rate_limit_reservations TO service_role;
 
+-- Attribute a lock to the exact reservation that exhausted the allowance. A
+-- different successful request can lower its own count but cannot cancel a
+-- lock created by concurrent failures.
+ALTER TABLE public.auth_rate_limit_attempts
+    ADD COLUMN IF NOT EXISTS lock_reservation_id uuid;
+
 -- Store only the greatest successfully accepted TOTP counter. A lower or equal
 -- counter is rejected, which also prevents a C-1 code from being used after C
 -- or C+1 was accepted.
@@ -129,12 +135,15 @@ BEGIN
         DELETE FROM public.auth_rate_limit_reservations
         WHERE scope = p_scope AND subject_key = p_subject_key;
         attempt_state.attempt_count := 0;
+        attempt_state.lock_reservation_id := NULL;
     END IF;
 
     IF attempt_state.attempt_count >= p_max_attempts THEN
         new_locked_until := current_time + make_interval(secs => p_lock_seconds);
         UPDATE public.auth_rate_limit_attempts
-        SET locked_until = new_locked_until, updated_at = current_time
+        SET locked_until = new_locked_until,
+            lock_reservation_id = NULL,
+            updated_at = current_time
         WHERE scope = p_scope AND subject_key = p_subject_key;
         RETURN QUERY SELECT false, NULL::uuid, new_locked_until;
         RETURN;
@@ -149,6 +158,10 @@ BEGIN
     UPDATE public.auth_rate_limit_attempts
     SET attempt_count = attempt_state.attempt_count + 1,
         locked_until = new_locked_until,
+        lock_reservation_id = CASE
+            WHEN new_locked_until IS NULL THEN NULL
+            ELSE p_reservation_id
+        END,
         updated_at = current_time
     WHERE scope = p_scope AND subject_key = p_subject_key;
 
@@ -160,7 +173,8 @@ END;
 $$;
 
 -- Finalize one exact request receipt. A failure keeps the reserved count;
--- success decrements only its own receipt, never a concurrent attempt.
+-- success decrements only its own receipt. It can clear a lock solely when the
+-- same receipt was the one that originally exhausted the allowance.
 CREATE OR REPLACE FUNCTION public.complete_auth_rate_limit_attempt(
     p_reservation_id uuid,
     p_succeeded boolean
@@ -204,7 +218,14 @@ BEGIN
     IF p_succeeded THEN
         UPDATE public.auth_rate_limit_attempts
         SET attempt_count = GREATEST(attempt_state.attempt_count - 1, 0),
-            locked_until = NULL,
+            locked_until = CASE
+                WHEN attempt_state.lock_reservation_id = p_reservation_id THEN NULL
+                ELSE attempt_state.locked_until
+            END,
+            lock_reservation_id = CASE
+                WHEN attempt_state.lock_reservation_id = p_reservation_id THEN NULL
+                ELSE attempt_state.lock_reservation_id
+            END,
             updated_at = current_time
         WHERE scope = reservation_state.scope
           AND subject_key = reservation_state.subject_key;

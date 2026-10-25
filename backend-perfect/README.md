@@ -65,8 +65,11 @@ servidor con la clave `service_role`.
    sola transacción el factor, el contador o código consumido y el UUID `jti`.
    Al acertar responde un `access_token` con `mfa_verified:true`.
 6. `POST /v1/auth/backup-codes` requiere `Authorization: Bearer <access_token>`
-   con MFA completo. Revoca atómicamente los códigos vigentes y devuelve diez
-   nuevos códigos de alta entropía una sola vez con `Cache-Control: no-store`.
+   con MFA completo emitido por un Step-Up realizado recientemente (cinco
+   minutos por defecto, `AUTH_BACKUP_CODE_RECENT_MFA_SECONDS`). Si la ventana
+   venció, el usuario debe iniciar sesión y completar MFA de nuevo. Revoca
+   atómicamente los códigos vigentes y devuelve diez nuevos códigos de alta
+   entropía una sola vez con `Cache-Control: no-store`.
 
 Los tres JWT contienen `sub`, `iss`, `aud`, `iat`, `exp`, `jti`, `token_type`
 y `mfa_verified`, pero son incompatibles por diseño:
@@ -87,7 +90,9 @@ y bloqueo de 15 minutos (`TOTP_VERIFY_MAX_ATTEMPTS` y
 `TOTP_VERIFY_LOCK_SECONDS`). El estado de ambos límites vive en Supabase y se
 serializa con bloqueos de fila. Un fallo conserva su consumo; un éxito libera
 solo su propia reserva y nunca borra los fallos o reservas concurrentes, por lo
-que el límite se aplica entre procesos e instancias.
+que el límite se aplica entre procesos e instancias. El bloqueo conserva el ID
+de la reserva que lo activó: otro éxito concurrente no puede levantarlo antes
+del plazo configurado.
 
 ## Anti-replay y códigos de respaldo
 

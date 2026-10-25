@@ -94,6 +94,7 @@ class Settings:
     pre_auth_token_ttl_seconds: int
     provisioning_token_ttl_seconds: int
     access_token_ttl_seconds: int
+    backup_code_recent_mfa_seconds: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -148,6 +149,9 @@ class Settings:
             ),
             access_token_ttl_seconds=_read_bounded_positive_int(
                 "AUTH_ACCESS_TOKEN_TTL_SECONDS", 3_600, minimum=300, maximum=86_400
+            ),
+            backup_code_recent_mfa_seconds=_read_bounded_positive_int(
+                "AUTH_BACKUP_CODE_RECENT_MFA_SECONDS", 300, minimum=60, maximum=900
             ),
         )
 
